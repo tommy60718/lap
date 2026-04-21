@@ -11,6 +11,9 @@ import tyro
 import lap.policies.policy_config_adapter as _policy_config
 from lap.training import config as _config
 
+import tensorflow as tf
+# Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch / JAX)
+tf.config.set_visible_devices([], 'GPU')
 
 class EnvMode(enum.Enum):
     """Supported environments."""
