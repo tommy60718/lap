@@ -13,6 +13,7 @@ import flax.nnx as nnx
 import flax.traverse_util as traverse_util
 import jax
 import jax.numpy as jnp
+import numpy as np
 import matplotlib
 from openpi.models import model as _model
 from openpi.models.model import Observation
@@ -271,7 +272,7 @@ def init_train_state(
                 else:
                     result[key] = val
             return result
-        if isinstance(partial_val, jax.Array):
+        if isinstance(partial_val, (jax.Array, np.ndarray)):
             # Extract sharding spec from full_sharding_tree (might be wrapped in NNX Param)
             sharding_spec = full_sharding_tree
             if hasattr(full_sharding_tree, "value"):
@@ -296,7 +297,7 @@ def init_train_state(
                 if key in full_sharding_tree:
                     result[key] = _extract_sharding_spec(val, full_sharding_tree[key])
             return result
-        if isinstance(partial_val, jax.Array):
+        if isinstance(partial_val, (jax.Array, np.ndarray)):
             # Extract sharding spec from full_sharding_tree (might be wrapped in NNX Param)
             sharding_spec = full_sharding_tree
             if hasattr(full_sharding_tree, "value"):

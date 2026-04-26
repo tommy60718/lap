@@ -21,7 +21,7 @@ OXE_NAMED_MIXTURES: dict[str, list[tuple[str, float]]] = {
         ("molmoact_dataset", 1.0),
     ],
     "libero_finetune": [
-        ("libero_10_no_noops", 1.0),
+        ("libero_10_no_noops", 2.0),
         ("libero_spatial_no_noops", 1.0),
         ("libero_object_no_noops", 1.0),
         ("libero_goal_no_noops", 1.0),
