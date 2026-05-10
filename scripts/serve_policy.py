@@ -75,8 +75,9 @@ def create_policy(args: Args) -> _policy.Policy:
 
     config = _config.get_config(checkpoint.config)
     # Always disable stop_action_to_vlm_grad for inference — this flag is only
-    # meaningful during training.
-    config = dataclasses.replace(config, model=dataclasses.replace(config.model, stop_action_to_vlm_grad=False))
+    # meaningful during training (LAP models only).
+    if hasattr(config.model, "stop_action_to_vlm_grad"):
+        config = dataclasses.replace(config, model=dataclasses.replace(config.model, stop_action_to_vlm_grad=False))
 
     if checkpoint.type == "ar":
         return _policy_config.create_trained_policy_ar(

@@ -484,14 +484,23 @@ def load_norm_stats(assets_dir: epath.Path | str) -> dict[str, _normalize_adapte
 
     assets_dir = epath.Path(assets_dir)
 
-    # Discover subdirectories that actually contain norm stats.
-    norm_dirs = [p for p in assets_dir.iterdir() if p.is_dir() and (p / "norm_stats.json").exists()]
+    # Discover directories that contain norm_stats.json (search up to 3 levels
+    # to handle HuggingFace checkpoints with nested asset paths like
+    # assets/jsiburian/ur5e_pick_carrot_150_v2/norm_stats.json).
+    norm_files = (
+        list(assets_dir.glob("*/norm_stats.json"))
+        or list(assets_dir.glob("*/*/norm_stats.json"))
+        or list(assets_dir.glob("*/*/*/norm_stats.json"))
+    )
 
-    assert len(norm_dirs) == 1, (
-        f"Expected exactly one norm stats directory in {assets_dir}, but found {len(norm_dirs)}: "
-        f"{[p.name for p in norm_dirs]}"
+    assert len(norm_files) >= 1, (
+        f"No norm_stats.json found anywhere under {assets_dir}"
+    )
+    if len(norm_files) > 1:
+        logging.warning(
+            f"Found multiple norm_stats.json under {assets_dir}: {norm_files}. Using first."
         )
-    candidate = norm_dirs[0]
+    candidate = norm_files[0].parent
     logging.info(f"Loaded norm stats from {candidate}")
 
     return _normalize_adapter.load(str(candidate))
