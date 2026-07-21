@@ -102,8 +102,8 @@ class CoverPolicyWrapper:
 
         if self._authority == "disabled":
             return self._infer_disabled(request)
-        if self._authority == "shadow":
-            return self._infer_shadow(request, noise=noise)
+        if self._authority in ("shadow", "active"):
+            return self._infer_cover(request, noise=noise)
         raise NotImplementedError(f"authority {self._authority!r} is not implemented yet")
 
     def _infer_disabled(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -135,9 +135,9 @@ class CoverPolicyWrapper:
             )
         return response
 
-    def _infer_shadow(self, request: dict[str, Any], *, noise: np.ndarray | None) -> dict[str, Any]:
+    def _infer_cover(self, request: dict[str, Any], *, noise: np.ndarray | None) -> dict[str, Any]:
         if self._history_manager is None or self._scorer is None:
-            raise ValueError("shadow authority requires history_manager and scorer")
+            raise ValueError(f"{self._authority} authority requires history_manager and scorer")
 
         episode_id, timestep = self._require_cover_metadata(request)
         instruction = str(request["prompt"])
@@ -180,11 +180,19 @@ class CoverPolicyWrapper:
             ),
             dtype=np.float64,
         )
-        if scores.shape != (self._candidate_count,):
+        if scores.ndim != 1 or scores.shape[0] != self._candidate_count:
             raise ValueError("scorer must return one score per candidate")
 
-        hypothetical = highest_finite_score_index(scores)
-        returned_index = 0
+        selected = highest_finite_score_index(scores)
+        if self._authority == "shadow":
+            returned_index = 0
+            hypothetical = selected
+        else:
+            if selected is None:
+                raise ValueError("no finite verifier scores")
+            returned_index = selected
+            hypothetical = None
+
         self._history_manager.store_pending_from_history(candidate_index=returned_index)
         actions = np.array(candidate_batch[returned_index], dtype=np.float64, copy=True)
 
@@ -192,7 +200,7 @@ class CoverPolicyWrapper:
         if self._diagnostics_enabled:
             response.update(
                 {
-                    "verifier_authority": "shadow",
+                    "verifier_authority": self._authority,
                     "execution_context": self._execution_context,
                     "candidate_count": self._candidate_count,
                     "returned_candidate_index": returned_index,
