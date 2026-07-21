@@ -1,4 +1,4 @@
-"""Stateful LAP-3 episode history manager (W4-02 first-request slice)."""
+"""Stateful LAP-3 episode history manager."""
 
 from __future__ import annotations
 
@@ -34,6 +34,18 @@ class EpisodeHistoryManager:
         return self._artifact_identity
 
     @property
+    def active_episode_id(self) -> str | None:
+        return self._active_episode_id
+
+    @property
+    def fixed_instruction(self) -> str | None:
+        return self._fixed_instruction
+
+    @property
+    def last_accepted_timestep(self) -> int | None:
+        return self._last_accepted_timestep
+
+    @property
     def committed_rows(self) -> np.ndarray:
         if not self._committed:
             return np.empty((0, 7), dtype=np.float64)
@@ -57,12 +69,26 @@ class EpisodeHistoryManager:
         self._pending = None
         self._last_histories = None
 
+    def install_committed_past(self, rows: np.ndarray) -> None:
+        """Install already-processed past rows for fixture/runtime parity checks."""
+        past = np.asarray(rows, dtype=np.float64)
+        if past.ndim != 2 or past.shape[1] != 7:
+            raise ValueError("committed past must have shape [P, 7]")
+        if past.shape[0] > 6:
+            raise ValueError("committed past must contain at most six actions")
+        if not np.isfinite(past).all():
+            raise ValueError("committed past must be finite")
+        self._committed = [np.array(row, dtype=np.float64, copy=True) for row in past]
+        self._pending = None
+        self._last_histories = None
+
     def prepare_request(
         self,
         *,
         episode_id: str,
         timestep: int,
         instruction: str,
+        expected_artifact_identity: str | None = None,
     ) -> str:
         """Validate/advance episode state for a scoring request. Returns state_event."""
         if not isinstance(episode_id, str) or not episode_id.strip():
@@ -72,6 +98,14 @@ class EpisodeHistoryManager:
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError("instruction must be a nonempty string")
 
+        has_rows = bool(self._committed) or self._pending is not None
+        if (
+            has_rows
+            and expected_artifact_identity is not None
+            and expected_artifact_identity != self._artifact_identity
+        ):
+            raise ValueError("normalization artifact identity mismatch")
+
         if timestep == 0:
             self.clear()
             self._active_episode_id = episode_id
@@ -79,8 +113,27 @@ class EpisodeHistoryManager:
             self._last_accepted_timestep = 0
             return "new_episode"
 
-        # W4-03 owns sequential commit behavior; W4-02 only exercises timestep 0.
-        raise ValueError("non-zero timestep sequential commits are not available until W4-03")
+        if self._active_episode_id is None or self._last_accepted_timestep is None:
+            raise ValueError("state discontinuity: nonzero timestep without an active episode")
+        if episode_id != self._active_episode_id:
+            raise ValueError("state discontinuity: episode_id changed at nonzero timestep")
+        if instruction != self._fixed_instruction:
+            raise ValueError("instruction changed under active episode")
+
+        expected_timestep = self._last_accepted_timestep + 1
+        if timestep == expected_timestep:
+            if self._pending is not None:
+                self._committed.append(np.array(self._pending, dtype=np.float64, copy=True))
+                if len(self._committed) > 6:
+                    self._committed = self._committed[-6:]
+                self._pending = None
+            self._last_accepted_timestep = timestep
+            return "advanced"
+        if timestep == self._last_accepted_timestep:
+            raise ValueError("duplicate timestep")
+        if timestep < self._last_accepted_timestep:
+            raise ValueError("stale timestep")
+        raise ValueError("skipped timestep")
 
     def build_histories(
         self,

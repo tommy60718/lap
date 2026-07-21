@@ -29,7 +29,14 @@ class HistoryManager(Protocol):
 
     def clear(self) -> None: ...
 
-    def prepare_request(self, *, episode_id: str, timestep: int, instruction: str) -> str: ...
+    def prepare_request(
+        self,
+        *,
+        episode_id: str,
+        timestep: int,
+        instruction: str,
+        expected_artifact_identity: str | None = None,
+    ) -> str: ...
 
     def build_histories(
         self,
@@ -138,6 +145,7 @@ class CoverPolicyWrapper:
             episode_id=episode_id,
             timestep=timestep,
             instruction=instruction,
+            expected_artifact_identity=self._scorer.compatibility.normalization_artifact_hash,
         )
 
         noise_copy = None if noise is None else np.array(noise, copy=True)
