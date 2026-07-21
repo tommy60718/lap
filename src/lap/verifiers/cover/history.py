@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from lap.verifiers.cover.action_adapter import ActionHistoryBatch
 from lap.verifiers.cover.action_adapter import NormalizationArtifact
 from lap.verifiers.cover.action_adapter import build_action_histories
+from lap.verifiers.cover.faults import CoverStateError
+from lap.verifiers.cover.faults import FallbackReason
+
+
+@dataclass(frozen=True)
+class PrepareResult:
+    state_event: str
+    fallback_reason: str | None = None
 
 
 class EpisodeHistoryManager:
@@ -69,6 +79,10 @@ class EpisodeHistoryManager:
         self._pending = None
         self._last_histories = None
 
+    def clear_pending(self) -> None:
+        """Drop only the pending row; keep committed episode continuity."""
+        self._pending = None
+
     def install_committed_past(self, rows: np.ndarray) -> None:
         """Install already-processed past rows for fixture/runtime parity checks."""
         past = np.asarray(rows, dtype=np.float64)
@@ -89,14 +103,24 @@ class EpisodeHistoryManager:
         timestep: int,
         instruction: str,
         expected_artifact_identity: str | None = None,
-    ) -> str:
-        """Validate/advance episode state for a scoring request. Returns state_event."""
+        execution_context: str = "test",
+    ) -> PrepareResult:
+        """Validate/advance episode state for a scoring request."""
         if not isinstance(episode_id, str) or not episode_id.strip():
-            raise ValueError("episode_id must be a nonempty string")
+            raise CoverStateError(
+                "episode_id must be a nonempty string",
+                fallback_reason=FallbackReason.MISSING_COVER_METADATA,
+            )
         if not isinstance(timestep, int) or isinstance(timestep, bool) or timestep < 0:
-            raise ValueError("timestep must be a nonnegative integer")
+            raise CoverStateError(
+                "timestep must be a nonnegative integer",
+                fallback_reason=FallbackReason.MISSING_COVER_METADATA,
+            )
         if not isinstance(instruction, str) or not instruction.strip():
-            raise ValueError("instruction must be a nonempty string")
+            raise CoverStateError(
+                "instruction must be a nonempty string",
+                fallback_reason=FallbackReason.INSTRUCTION_CHANGED,
+            )
 
         has_rows = bool(self._committed) or self._pending is not None
         if (
@@ -104,21 +128,37 @@ class EpisodeHistoryManager:
             and expected_artifact_identity is not None
             and expected_artifact_identity != self._artifact_identity
         ):
-            raise ValueError("normalization artifact identity mismatch")
+            return self._discontinuity(
+                execution_context=execution_context,
+                message="normalization artifact identity mismatch",
+                fallback_reason=FallbackReason.INCOMPATIBLE_VERIFIER_ASSETS,
+            )
 
         if timestep == 0:
             self.clear()
             self._active_episode_id = episode_id
             self._fixed_instruction = instruction
             self._last_accepted_timestep = 0
-            return "new_episode"
+            return PrepareResult("new_episode")
 
         if self._active_episode_id is None or self._last_accepted_timestep is None:
-            raise ValueError("state discontinuity: nonzero timestep without an active episode")
+            return self._discontinuity(
+                execution_context=execution_context,
+                message="state discontinuity: nonzero timestep without an active episode",
+                fallback_reason=FallbackReason.STATE_DISCONTINUITY,
+            )
         if episode_id != self._active_episode_id:
-            raise ValueError("state discontinuity: episode_id changed at nonzero timestep")
+            return self._discontinuity(
+                execution_context=execution_context,
+                message="state discontinuity: episode_id changed at nonzero timestep",
+                fallback_reason=FallbackReason.STATE_DISCONTINUITY,
+            )
         if instruction != self._fixed_instruction:
-            raise ValueError("instruction changed under active episode")
+            return self._discontinuity(
+                execution_context=execution_context,
+                message="instruction changed under active episode",
+                fallback_reason=FallbackReason.INSTRUCTION_CHANGED,
+            )
 
         expected_timestep = self._last_accepted_timestep + 1
         if timestep == expected_timestep:
@@ -128,12 +168,36 @@ class EpisodeHistoryManager:
                     self._committed = self._committed[-6:]
                 self._pending = None
             self._last_accepted_timestep = timestep
-            return "advanced"
+            return PrepareResult("advanced")
         if timestep == self._last_accepted_timestep:
-            raise ValueError("duplicate timestep")
+            return self._discontinuity(
+                execution_context=execution_context,
+                message="duplicate timestep",
+                fallback_reason=FallbackReason.STATE_DISCONTINUITY,
+            )
         if timestep < self._last_accepted_timestep:
-            raise ValueError("stale timestep")
-        raise ValueError("skipped timestep")
+            return self._discontinuity(
+                execution_context=execution_context,
+                message="stale timestep",
+                fallback_reason=FallbackReason.STATE_DISCONTINUITY,
+            )
+        return self._discontinuity(
+            execution_context=execution_context,
+            message="skipped timestep",
+            fallback_reason=FallbackReason.STATE_DISCONTINUITY,
+        )
+
+    def _discontinuity(
+        self,
+        *,
+        execution_context: str,
+        message: str,
+        fallback_reason: str,
+    ) -> PrepareResult:
+        if execution_context == "robot":
+            self.clear()
+            return PrepareResult("discontinuity_reset", fallback_reason)
+        raise CoverStateError(message, fallback_reason=fallback_reason)
 
     def build_histories(
         self,

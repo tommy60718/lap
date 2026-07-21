@@ -51,6 +51,8 @@ class ScorerCompatibility:
 class FakeCoverScorer:
     """Deterministic score-only LAP-4 double for W4 fake integration."""
 
+    is_fake = True
+
     def __init__(
         self,
         *,

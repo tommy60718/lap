@@ -14,6 +14,7 @@ from lap.verifiers.cover.action_adapter import ACTION_ORDER
 from lap.verifiers.cover.action_adapter import REPRESENTATION_ID
 from lap.verifiers.cover.action_adapter import NormalizationArtifact
 from lap.verifiers.cover.history import EpisodeHistoryManager
+from lap.verifiers.cover.history import PrepareResult
 from lap.verifiers.cover.scorer import FakeCoverScorer
 from lap.verifiers.cover.scorer import ScorerCompatibility
 
@@ -112,11 +113,11 @@ class FixturePastHistoryManager(EpisodeHistoryManager):
         super().__init__(**kwargs)
         self._fixture_past = np.asarray(fixture_past, dtype=np.float64)
 
-    def prepare_request(self, **kwargs: Any) -> str:
-        event = super().prepare_request(**kwargs)
+    def prepare_request(self, **kwargs: Any) -> PrepareResult:
+        result = super().prepare_request(**kwargs)
         if kwargs.get("timestep") == 0:
             self.install_committed_past(self._fixture_past)
-        return event
+        return result
 
 
 def _shadow_policy(
