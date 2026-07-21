@@ -130,6 +130,11 @@ class CoverPolicyWrapper:
             return self._infer_cover(request, noise=noise)
         raise NotImplementedError(f"authority {self._authority!r} is not implemented yet")
 
+    def reset_session(self) -> None:
+        """Discard cover episode history when the owning WebSocket client disconnects."""
+        if self._history_manager is not None:
+            self._history_manager.clear()
+
     def _infer_disabled(self, request: dict[str, Any]) -> dict[str, Any]:
         if self._history_manager is not None:
             self._history_manager.clear()
