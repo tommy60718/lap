@@ -304,3 +304,38 @@ def build_action_histories(
         histories[:, 6 - past.shape[0] : 6] = past.astype(np.float32)
     histories[:, 6:10] = relative.astype(np.float32)
     return ActionHistoryBatch(histories=histories)
+
+
+def assemble_training_action_history(
+    *,
+    relative_rows: np.ndarray,
+    normalization: NormalizationArtifact,
+) -> np.ndarray:
+    """Normalize unpadded relative rows and left-pad to float32[10, 7]."""
+    rows = np.asarray(relative_rows, dtype=np.float64)
+    if rows.ndim != 2 or rows.shape[1] != 7 or rows.shape[0] == 0:
+        raise ValueError("relative_rows must have shape [K, 7] with K >= 1")
+    if rows.shape[0] > 10:
+        raise ValueError("relative_rows exceed history length 10")
+    if not np.isfinite(rows).all():
+        raise ValueError("relative_rows must be finite")
+    if np.any((rows[:, 6] < 0.0) | (rows[:, 6] > 1.0)):
+        raise ValueError("relative row gripper must be within [0, 1]")
+    if rows.shape[0] < 4:
+        raise ValueError("relative_rows must contain four future actions")
+    past_count = rows.shape[0] - 4
+    if past_count > 6:
+        raise ValueError("relative_rows may contain at most six past actions")
+
+    q01 = np.asarray(normalization.q01, dtype=np.float64)
+    q99 = np.asarray(normalization.q99, dtype=np.float64)
+    if q01.shape != (6,) or q99.shape != (6,) or not np.isfinite(q01).all() or not np.isfinite(q99).all():
+        raise ValueError("normalization quantiles must be finite 6-vectors")
+    if np.any(q99 <= q01):
+        raise ValueError("normalization artifact q99 must be greater than q01")
+
+    normalized = rows.copy()
+    normalized[:, :6] = (normalized[:, :6] - q01) / (q99 - q01 + NORMALIZATION_EPSILON) * 2.0 - 1.0
+    history = np.full((10, 7), -5.0, dtype=np.float32)
+    history[6 - past_count : 10] = normalized.astype(np.float32)
+    return history
