@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
-from typing import Literal
-from typing import Protocol
+from typing import Any, Literal, Protocol
 
 import numpy as np
 
@@ -240,7 +238,7 @@ class CoverPolicyWrapper:
                 reference_rotation_vector=np.asarray(request["eef_rot"], dtype=np.float64),
                 candidate_chunks=candidate_batch,
             )
-        except Exception as error:  # noqa: BLE001 - classify as history fault
+        except Exception as error:
             raise CoverVerifierError(
                 str(error),
                 fallback_reason=FallbackReason.HISTORY_INVALID,
@@ -278,7 +276,7 @@ class CoverPolicyWrapper:
                 instruction=instruction,
                 action_histories=histories,
             )
-        except Exception as error:  # noqa: BLE001 - unavailable scorer
+        except Exception as error:
             raise CoverVerifierError(
                 str(error),
                 fallback_reason=FallbackReason.VERIFIER_UNAVAILABLE,
@@ -286,7 +284,9 @@ class CoverPolicyWrapper:
             ) from error
 
         try:
-            scores = np.asarray(raw_scores, dtype=np.float64)
+            scores = self._coerce_numeric_scores(raw_scores)
+        except CoverVerifierError:
+            raise
         except (TypeError, ValueError) as error:
             raise CoverVerifierError(
                 "scorer must return a numeric one-score-per-candidate vector",
@@ -296,12 +296,6 @@ class CoverPolicyWrapper:
         if scores.ndim != 1 or scores.shape[0] != self._candidate_count:
             raise CoverVerifierError(
                 "scorer must return one score per candidate",
-                fallback_reason=FallbackReason.SCORES_INVALID,
-                store_pending=True,
-            )
-        if not np.issubdtype(scores.dtype, np.floating) and not np.issubdtype(scores.dtype, np.integer):
-            raise CoverVerifierError(
-                "scorer must return a numeric one-score-per-candidate vector",
                 fallback_reason=FallbackReason.SCORES_INVALID,
                 store_pending=True,
             )
@@ -381,13 +375,39 @@ class CoverPolicyWrapper:
             }
             json.dumps(diagnostics, allow_nan=False)
             response.update(diagnostics)
-        except Exception as error:  # noqa: BLE001 - diagnostic serialization fault
+        except Exception as error:
             if self._execution_context != "robot":
                 raise
             self._last_diagnostic_fault = FallbackReason.DIAGNOSTIC_SERIALIZATION_FAILED
             logger.exception("diagnostic serialization failed: %s", error)
             return {"actions": actions}
         return response
+
+    @staticmethod
+    def _coerce_numeric_scores(raw_scores: Any) -> np.ndarray:
+        """Require a real numeric raw dtype before float64 conversion."""
+        if raw_scores is None or isinstance(raw_scores, (str, bytes)):
+            raise CoverVerifierError(
+                "scorer must return a numeric one-score-per-candidate vector",
+                fallback_reason=FallbackReason.SCORES_INVALID,
+                store_pending=True,
+            )
+        array = np.asarray(raw_scores)
+        # Bool is a numpy integer subtype; reject it explicitly. Also reject
+        # unicode/bytes/object/complex dtypes that NumPy would otherwise coerce.
+        if array.dtype.kind in {"U", "S", "O", "c", "?"} or np.issubdtype(array.dtype, np.bool_):
+            raise CoverVerifierError(
+                "scorer must return a numeric one-score-per-candidate vector",
+                fallback_reason=FallbackReason.SCORES_INVALID,
+                store_pending=True,
+            )
+        if not (np.issubdtype(array.dtype, np.floating) or np.issubdtype(array.dtype, np.integer)):
+            raise CoverVerifierError(
+                "scorer must return a numeric one-score-per-candidate vector",
+                fallback_reason=FallbackReason.SCORES_INVALID,
+                store_pending=True,
+            )
+        return np.asarray(array, dtype=np.float64)
 
     @staticmethod
     def _finite_or_null_scores(scores: np.ndarray | None) -> list[float] | None:
@@ -405,9 +425,7 @@ class CoverPolicyWrapper:
         if self._scorer_validated:
             return
         compatibility = self._scorer.compatibility
-        compatibility.validate_against_expected(
-            expected_normalization_hash=self._history_manager.artifact_identity
-        )
+        compatibility.validate_against_expected(expected_normalization_hash=self._history_manager.artifact_identity)
         self._scorer_validated = True
 
     def _require_cover_metadata(self, request: dict[str, Any]) -> tuple[str, int]:

@@ -19,11 +19,7 @@ from lap.verifiers.cover.scorer import FakeCoverScorer
 from lap.verifiers.cover.scorer import ScorerCompatibility
 
 CONSUMER_FIXTURE = (
-    Path(__file__).resolve().parents[1]
-    / "verifiers"
-    / "cover"
-    / "testdata"
-    / "ur5e_cover_action_adapter_v1.json"
+    Path(__file__).resolve().parents[1] / "verifiers" / "cover" / "testdata" / "ur5e_cover_action_adapter_v1.json"
 )
 
 
@@ -193,7 +189,7 @@ def test_sequential_requests_cover_past_lengths_zero_through_six() -> None:
     policy, history, scorer, _ = _shadow_policy(candidate_count=2, seed=21, vary_by_timestep=True)
     first_committed_row: np.ndarray | None = None
 
-    for timestep in range(0, 8):
+    for timestep in range(8):
         response = policy.infer(_request(timestep=timestep))
         assert response["returned_candidate_index"] == 0
         if timestep == 0:
@@ -262,7 +258,8 @@ def test_duplicate_episode_start_raises_in_test_without_clearing_or_generating()
     assert after["timestep"] == before["timestep"]
     assert after["instruction"] == before["instruction"]
     np.testing.assert_array_equal(after["committed"], before["committed"])
-    assert after["pending"] is not None and before["pending"] is not None
+    assert after["pending"] is not None
+    assert before["pending"] is not None
     np.testing.assert_array_equal(after["pending"], before["pending"])
     assert len(generator.calls) == calls_before
     assert len(scorer.calls) == score_calls_before
@@ -281,8 +278,10 @@ def test_duplicate_episode_start_immediately_after_first_request_raises() -> Non
     after = _snapshot_state(history)
     assert after["episode"] == before["episode"]
     assert after["timestep"] == before["timestep"]
-    assert after["committed"] is None and before["committed"] is None
-    assert after["pending"] is not None and before["pending"] is not None
+    assert after["committed"] is None
+    assert before["committed"] is None
+    assert after["pending"] is not None
+    assert before["pending"] is not None
     np.testing.assert_array_equal(after["pending"], before["pending"])
     assert len(generator.calls) == calls_before
     assert len(scorer.calls) == score_calls_before

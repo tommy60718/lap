@@ -8,7 +8,9 @@ import time
 from typing import Any
 
 import numpy as np
+from openpi_client import msgpack_numpy
 import pytest
+import websockets.exceptions
 import websockets.sync.client
 
 from lap.policies.cover_policy_wrapper import CoverPolicyWrapper
@@ -16,10 +18,10 @@ from lap.serving.single_session_websocket_server import SingleSessionWebsocketPo
 from lap.verifiers.cover.action_adapter import ACTION_ORDER
 from lap.verifiers.cover.action_adapter import REPRESENTATION_ID
 from lap.verifiers.cover.action_adapter import NormalizationArtifact
+from lap.verifiers.cover.faults import FallbackReason
 from lap.verifiers.cover.history import EpisodeHistoryManager
 from lap.verifiers.cover.scorer import FakeCoverScorer
 from lap.verifiers.cover.scorer import ScorerCompatibility
-from openpi_client import msgpack_numpy
 
 
 def _finite_chunk(*, seed: int) -> np.ndarray:
@@ -103,7 +105,7 @@ def _wait_connect(host: str, port: int, *, attempts: int = 40):
             conn = websockets.sync.client.connect(f"ws://{host}:{port}", compression=None, max_size=None)
             metadata = msgpack_numpy.unpackb(conn.recv())
             return conn, metadata, packer
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             last_error = error
             time.sleep(0.05)
     raise RuntimeError(f"server did not accept connections: {last_error}")
@@ -217,6 +219,134 @@ def test_websocket_partial_nonfinite_scores_match_direct_null_diagnostics() -> N
     assert payload["fallback_reason"] is None
 
 
+def test_websocket_robot_verifier_fallback_matches_direct() -> None:
+    """Robot-context post-candidate fallback must match over WebSocket."""
+    request = _cover_request()
+    request["wrist_rgb"] = np.zeros((224, 224, 3), dtype=np.uint8)
+    candidates = _candidate_batch(2, seed=11)
+    artifact = "a" * 64
+
+    def _robot_policy() -> tuple[CoverPolicyWrapper, EpisodeHistoryManager]:
+        history = EpisodeHistoryManager(normalization=_normalization(), artifact_identity=artifact)
+        policy = CoverPolicyWrapper(
+            authority="active",
+            execution_context="robot",
+            candidate_count=2,
+            candidate_generator=RecordingCandidateGenerator(candidates),
+            history_manager=history,
+            scorer=FakeCoverScorer(
+                scores=[0.1, 0.9],
+                compatibility=_compatibility(artifact_hash=artifact),
+            ),
+            allow_fake_scorer=True,
+        )
+        return policy, history
+
+    direct_policy, direct_history = _robot_policy()
+    direct = direct_policy.infer(request)
+    assert direct["fallback_reason"] == FallbackReason.MISSING_OR_ZERO_WRIST_VIEW
+    assert direct["verifier_scores"] is None
+    assert direct["returned_candidate_index"] == 0
+    assert direct["hypothetical_selected_candidate_index"] is None
+    assert direct_history.pending_row is not None
+    direct_pending = direct_history.pending_row.copy()
+
+    served_policy, served_history = _robot_policy()
+    port = _reserve_port()
+    server = SingleSessionWebsocketPolicyServer(
+        policy=served_policy,
+        host="127.0.0.1",
+        port=port,
+        metadata={"server_type": "pi05_cover", "verifier_authority": "active"},
+        on_session_end=served_policy.reset_session,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    conn, _, packer = _wait_connect("127.0.0.1", port)
+    try:
+        conn.send(packer.pack(request))
+        payload = msgpack_numpy.unpackb(conn.recv())
+        # Inspect pending before disconnect; on_session_end clears history.
+        assert served_history.pending_row is not None
+        np.testing.assert_array_equal(served_history.pending_row, direct_pending)
+    finally:
+        conn.close()
+
+    np.testing.assert_array_equal(np.asarray(payload["actions"]), np.asarray(direct["actions"]))
+    np.testing.assert_array_equal(np.asarray(payload["actions"]), candidates[0])
+    assert payload["returned_candidate_index"] == direct["returned_candidate_index"]
+    assert payload["hypothetical_selected_candidate_index"] == direct["hypothetical_selected_candidate_index"]
+    assert payload["verifier_scores"] is None
+    assert payload["fallback_reason"] == direct["fallback_reason"]
+    assert payload["state_event"] == direct["state_event"]
+
+
+def test_websocket_robot_scores_invalid_fallback_matches_direct() -> None:
+    """Robot scores_invalid fallback must match over WebSocket, including null scores."""
+    request = _cover_request()
+    candidates = _candidate_batch(2, seed=12)
+    artifact = "a" * 64
+
+    class StringScorer:
+        is_fake = True
+
+        def __init__(self) -> None:
+            self.compatibility = _compatibility(artifact_hash=artifact)
+
+        def score(self, **kwargs: Any) -> Any:
+            return ["0.2", "0.8"]
+
+    def _robot_policy() -> tuple[CoverPolicyWrapper, EpisodeHistoryManager]:
+        history = EpisodeHistoryManager(normalization=_normalization(), artifact_identity=artifact)
+        policy = CoverPolicyWrapper(
+            authority="active",
+            execution_context="robot",
+            candidate_count=2,
+            candidate_generator=RecordingCandidateGenerator(candidates),
+            history_manager=history,
+            scorer=StringScorer(),
+            allow_fake_scorer=True,
+        )
+        return policy, history
+
+    direct_policy, direct_history = _robot_policy()
+    direct = direct_policy.infer(request)
+    assert direct["fallback_reason"] == FallbackReason.SCORES_INVALID
+    assert direct["verifier_scores"] is None
+    assert direct["returned_candidate_index"] == 0
+    assert direct["hypothetical_selected_candidate_index"] is None
+    assert direct_history.pending_row is not None
+    direct_pending = direct_history.pending_row.copy()
+
+    served_policy, served_history = _robot_policy()
+    port = _reserve_port()
+    server = SingleSessionWebsocketPolicyServer(
+        policy=served_policy,
+        host="127.0.0.1",
+        port=port,
+        metadata={"server_type": "pi05_cover", "verifier_authority": "active"},
+        on_session_end=served_policy.reset_session,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    conn, _, packer = _wait_connect("127.0.0.1", port)
+    try:
+        conn.send(packer.pack(request))
+        payload = msgpack_numpy.unpackb(conn.recv())
+        assert served_history.pending_row is not None
+        np.testing.assert_array_equal(served_history.pending_row, direct_pending)
+    finally:
+        conn.close()
+
+    np.testing.assert_array_equal(np.asarray(payload["actions"]), np.asarray(direct["actions"]))
+    np.testing.assert_array_equal(np.asarray(payload["actions"]), candidates[0])
+    assert payload["returned_candidate_index"] == direct["returned_candidate_index"]
+    assert payload["hypothetical_selected_candidate_index"] == direct["hypothetical_selected_candidate_index"]
+    assert payload["verifier_scores"] is None
+    assert payload["fallback_reason"] == FallbackReason.SCORES_INVALID
+    assert payload["state_event"] == direct["state_event"]
+
+
 def test_second_concurrent_client_is_rejected_without_mutating_owner_state() -> None:
     policy, history = _shadow_policy(seed=3)
     port = _reserve_port()
@@ -238,7 +368,7 @@ def test_second_concurrent_client_is_rejected_without_mutating_owner_state() -> 
     before = history.pending_row.copy()
 
     rejected = websockets.sync.client.connect(f"ws://127.0.0.1:{port}", compression=None, max_size=None)
-    with pytest.raises(Exception):
+    with pytest.raises(websockets.exceptions.ConnectionClosed):
         # Second client must be closed before any metadata/infer exchange completes.
         _ = rejected.recv()
     rejected.close()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import numpy as np
@@ -97,7 +98,9 @@ class FaultingCandidateGenerator:
 class FaultingScorer:
     is_fake = True
 
-    def __init__(self, *, error: Exception | None = None, scores: np.ndarray | None = None, compatibility: ScorerCompatibility) -> None:
+    def __init__(
+        self, *, error: Exception | None = None, scores: np.ndarray | None = None, compatibility: ScorerCompatibility
+    ) -> None:
         self._error = error
         self._scores = None if scores is None else np.asarray(scores, dtype=np.float64)
         self.compatibility = compatibility
@@ -383,6 +386,9 @@ def test_duplicate_episode_start_robot_falls_back_without_pending(authority: str
     assert ok["fallback_reason"] is None
     assert ok["state_event"] == "new_episode"
 
+
+@pytest.mark.parametrize("authority", ["shadow", "active"])
+def test_missing_metadata_robot_generates_then_falls_back_without_pending(authority: str) -> None:
     candidates = _candidate_batch(2, seed=18)
     policy, history, _, generator = _policy(
         authority=authority,
@@ -578,6 +584,74 @@ def test_nonnumeric_scores_raise_in_test(authority: str, bad_scores: Any) -> Non
 
 
 @pytest.mark.parametrize("authority", ["shadow", "active"])
+@pytest.mark.parametrize(
+    "bad_scores",
+    [
+        ["0.2", "0.8"],  # numeric strings must not coerce into valid scores
+        np.asarray([True, False]),
+        np.asarray([1 + 2j, 3 + 4j]),
+        np.asarray(["0.1", "0.9"], dtype=object),
+    ],
+)
+def test_coercible_but_nonnumeric_raw_dtype_raises_in_test(authority: str, bad_scores: Any) -> None:
+    class CoercibleScorer:
+        is_fake = True
+
+        def __init__(self) -> None:
+            self.compatibility = _compatibility()
+
+        def score(self, **kwargs: Any) -> Any:
+            return bad_scores
+
+    policy, history, _, generator = _policy(
+        authority=authority,
+        execution_context="test",
+        seed=44,
+        scorer=CoercibleScorer(),
+    )
+    with pytest.raises(CoverVerifierError) as caught:
+        policy.infer(_request())
+    assert caught.value.fallback_reason == FallbackReason.SCORES_INVALID
+    assert history.pending_row is None
+    assert len(generator.calls) == 1
+
+
+@pytest.mark.parametrize("authority", ["shadow", "active"])
+@pytest.mark.parametrize(
+    "bad_scores",
+    [
+        ["0.2", "0.8"],  # numeric strings must not coerce into valid scores
+        np.asarray([True, False]),
+        np.asarray([1 + 2j, 3 + 4j]),
+        np.asarray(["0.1", "0.9"], dtype=object),
+    ],
+)
+def test_coercible_but_nonnumeric_raw_dtype_robot_falls_back_with_pending(authority: str, bad_scores: Any) -> None:
+    candidates = _candidate_batch(2, seed=45)
+
+    class CoercibleScorer:
+        is_fake = True
+
+        def __init__(self) -> None:
+            self.compatibility = _compatibility()
+
+        def score(self, **kwargs: Any) -> Any:
+            return bad_scores
+
+    policy, history, _, _ = _policy(
+        authority=authority,
+        execution_context="robot",
+        generator=RecordingCandidateGenerator(candidates),
+        scorer=CoercibleScorer(),
+    )
+    response = policy.infer(_request())
+    np.testing.assert_array_equal(response["actions"], candidates[0])
+    assert response["fallback_reason"] == FallbackReason.SCORES_INVALID
+    assert response["verifier_scores"] is None
+    np.testing.assert_array_equal(history.pending_row, history.last_histories[0, 6])
+
+
+@pytest.mark.parametrize("authority", ["shadow", "active"])
 def test_nonnumeric_scores_robot_falls_back_with_pending(authority: str) -> None:
     candidates = _candidate_batch(2, seed=41)
 
@@ -627,8 +701,6 @@ def test_partial_nonfinite_scores_select_but_diagnostics_are_null(authority: str
         np.testing.assert_array_equal(response["actions"], candidates[1])
         np.testing.assert_array_equal(history.pending_row, history.last_histories[1, 6])
     # Strict JSON must accept the assembled diagnostics.
-    import json
-
     json.dumps(
         {k: v for k, v in response.items() if k != "actions"},
         allow_nan=False,
