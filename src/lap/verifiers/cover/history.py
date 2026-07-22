@@ -135,6 +135,18 @@ class EpisodeHistoryManager:
             )
 
         if timestep == 0:
+            # Replaying t=0 for the already-active episode is a discontinuity.
+            # A different episode ID at t=0 remains an explicit reset.
+            if (
+                self._active_episode_id is not None
+                and self._last_accepted_timestep is not None
+                and episode_id == self._active_episode_id
+            ):
+                return self._discontinuity(
+                    execution_context=execution_context,
+                    message="duplicate timestep",
+                    fallback_reason=FallbackReason.STATE_DISCONTINUITY,
+                )
             self.clear()
             self._active_episode_id = episode_id
             self._fixed_instruction = instruction

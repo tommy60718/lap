@@ -359,7 +359,30 @@ def test_artifact_mismatch_robot_falls_back_without_pending(authority: str) -> N
 
 
 @pytest.mark.parametrize("authority", ["shadow", "active"])
-def test_missing_metadata_robot_generates_then_falls_back_without_pending(authority: str) -> None:
+def test_duplicate_episode_start_robot_falls_back_without_pending(authority: str) -> None:
+    candidates = _candidate_batch(2, seed=26)
+    policy, history, _, generator = _policy(
+        authority=authority,
+        execution_context="robot",
+        generator=RecordingCandidateGenerator(candidates),
+        scores=np.asarray([0.2, 0.7], dtype=np.float64),
+    )
+    policy.infer(_request(episode_id="ep-1", timestep=0))
+    assert history.pending_row is not None
+    calls_after_first = len(generator.calls)
+
+    response = policy.infer(_request(episode_id="ep-1", timestep=0))
+    np.testing.assert_array_equal(response["actions"], candidates[0])
+    assert response["fallback_reason"] == FallbackReason.STATE_DISCONTINUITY
+    assert response["state_event"] == "discontinuity_reset"
+    assert history.pending_row is None
+    assert history.active_episode_id is None
+    assert len(generator.calls) == calls_after_first + 1
+
+    ok = policy.infer(_request(episode_id="ep-2", timestep=0))
+    assert ok["fallback_reason"] is None
+    assert ok["state_event"] == "new_episode"
+
     candidates = _candidate_batch(2, seed=18)
     policy, history, _, generator = _policy(
         authority=authority,
@@ -519,3 +542,106 @@ def test_diagnostic_serialization_fault_raises_in_test(monkeypatch: pytest.Monke
     monkeypatch.setattr("lap.policies.cover_policy_wrapper.json.dumps", boom)
     with pytest.raises(TypeError, match="cannot serialize"):
         policy.infer(_request())
+
+
+@pytest.mark.parametrize("authority", ["shadow", "active"])
+@pytest.mark.parametrize(
+    "bad_scores",
+    [
+        "not-a-vector",
+        ["a", "b"],
+        np.array([{"x": 1}, {"y": 2}], dtype=object),
+        None,
+    ],
+)
+def test_nonnumeric_scores_raise_in_test(authority: str, bad_scores: Any) -> None:
+    class NonNumericScorer:
+        is_fake = True
+
+        def __init__(self) -> None:
+            self.compatibility = _compatibility()
+
+        def score(self, **kwargs: Any) -> Any:
+            return bad_scores
+
+    policy, history, _, generator = _policy(
+        authority=authority,
+        execution_context="test",
+        seed=40,
+        scorer=NonNumericScorer(),
+    )
+    with pytest.raises(CoverVerifierError) as caught:
+        policy.infer(_request())
+    assert caught.value.fallback_reason == FallbackReason.SCORES_INVALID
+    assert history.pending_row is None
+    assert len(generator.calls) == 1
+
+
+@pytest.mark.parametrize("authority", ["shadow", "active"])
+def test_nonnumeric_scores_robot_falls_back_with_pending(authority: str) -> None:
+    candidates = _candidate_batch(2, seed=41)
+
+    class NonNumericScorer:
+        is_fake = True
+
+        def __init__(self) -> None:
+            self.compatibility = _compatibility()
+
+        def score(self, **kwargs: Any) -> Any:
+            return ["x", "y"]
+
+    policy, history, _, _ = _policy(
+        authority=authority,
+        execution_context="robot",
+        generator=RecordingCandidateGenerator(candidates),
+        scorer=NonNumericScorer(),
+    )
+    response = policy.infer(_request())
+    np.testing.assert_array_equal(response["actions"], candidates[0])
+    assert response["fallback_reason"] == FallbackReason.SCORES_INVALID
+    np.testing.assert_array_equal(history.pending_row, history.last_histories[0, 6])
+
+
+@pytest.mark.parametrize("authority", ["shadow", "active"])
+def test_partial_nonfinite_scores_select_but_diagnostics_are_null(authority: str) -> None:
+    candidates = _candidate_batch(3, seed=42)
+    scores = np.asarray([np.nan, 0.4, np.inf], dtype=np.float64)
+    policy, history, _, _ = _policy(
+        authority=authority,
+        execution_context="test",
+        candidate_count=3,
+        generator=RecordingCandidateGenerator(candidates),
+        scores=scores,
+    )
+    response = policy.infer(_request())
+    assert response["fallback_reason"] is None
+    assert response["verifier_scores"] is None
+    if authority == "shadow":
+        assert response["returned_candidate_index"] == 0
+        assert response["hypothetical_selected_candidate_index"] == 1
+        np.testing.assert_array_equal(response["actions"], candidates[0])
+        np.testing.assert_array_equal(history.pending_row, history.last_histories[0, 6])
+    else:
+        assert response["returned_candidate_index"] == 1
+        assert response["hypothetical_selected_candidate_index"] is None
+        np.testing.assert_array_equal(response["actions"], candidates[1])
+        np.testing.assert_array_equal(history.pending_row, history.last_histories[1, 6])
+    # Strict JSON must accept the assembled diagnostics.
+    import json
+
+    json.dumps(
+        {k: v for k, v in response.items() if k != "actions"},
+        allow_nan=False,
+    )
+
+
+def test_fully_finite_scores_emit_finite_list() -> None:
+    policy, _, _, _ = _policy(
+        authority="active",
+        execution_context="test",
+        candidate_count=2,
+        seed=43,
+        scores=np.asarray([0.2, 0.8], dtype=np.float64),
+    )
+    response = policy.infer(_request())
+    assert response["verifier_scores"] == [0.2, 0.8]

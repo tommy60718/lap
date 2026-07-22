@@ -285,10 +285,23 @@ class CoverPolicyWrapper:
                 store_pending=True,
             ) from error
 
-        scores = np.asarray(raw_scores, dtype=np.float64)
+        try:
+            scores = np.asarray(raw_scores, dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            raise CoverVerifierError(
+                "scorer must return a numeric one-score-per-candidate vector",
+                fallback_reason=FallbackReason.SCORES_INVALID,
+                store_pending=True,
+            ) from error
         if scores.ndim != 1 or scores.shape[0] != self._candidate_count:
             raise CoverVerifierError(
                 "scorer must return one score per candidate",
+                fallback_reason=FallbackReason.SCORES_INVALID,
+                store_pending=True,
+            )
+        if not np.issubdtype(scores.dtype, np.floating) and not np.issubdtype(scores.dtype, np.integer):
+            raise CoverVerifierError(
+                "scorer must return a numeric one-score-per-candidate vector",
                 fallback_reason=FallbackReason.SCORES_INVALID,
                 store_pending=True,
             )
@@ -362,11 +375,11 @@ class CoverPolicyWrapper:
                 "candidate_count": self._candidate_count if candidate_count is None else candidate_count,
                 "returned_candidate_index": returned_index,
                 "hypothetical_selected_candidate_index": hypothetical,
-                "verifier_scores": None if scores is None else scores.tolist(),
+                "verifier_scores": self._finite_or_null_scores(scores),
                 "fallback_reason": fallback_reason,
                 "state_event": state_event,
             }
-            json.dumps(diagnostics)
+            json.dumps(diagnostics, allow_nan=False)
             response.update(diagnostics)
         except Exception as error:  # noqa: BLE001 - diagnostic serialization fault
             if self._execution_context != "robot":
@@ -375,6 +388,16 @@ class CoverPolicyWrapper:
             logger.exception("diagnostic serialization failed: %s", error)
             return {"actions": actions}
         return response
+
+    @staticmethod
+    def _finite_or_null_scores(scores: np.ndarray | None) -> list[float] | None:
+        """Expose only a fully finite score list; otherwise null (never NaN/Inf)."""
+        if scores is None:
+            return None
+        array = np.asarray(scores, dtype=np.float64)
+        if array.ndim != 1 or not np.isfinite(array).all():
+            return None
+        return [float(value) for value in array.tolist()]
 
     def _ensure_scorer_compatible(self) -> None:
         if self._history_manager is None or self._scorer is None:

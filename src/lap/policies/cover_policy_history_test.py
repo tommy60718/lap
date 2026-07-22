@@ -246,6 +246,48 @@ def test_duplicate_skipped_and_stale_timesteps_raise_without_mutation() -> None:
     assert len(generator.calls) == calls_after
 
 
+def test_duplicate_episode_start_raises_in_test_without_clearing_or_generating() -> None:
+    policy, history, scorer, generator = _shadow_policy(candidate_count=2, seed=32)
+    policy.infer(_request(episode_id="ep-1", timestep=0))
+    policy.infer(_request(episode_id="ep-1", timestep=1))
+    before = _snapshot_state(history)
+    calls_before = len(generator.calls)
+    score_calls_before = len(scorer.calls)
+
+    with pytest.raises(ValueError, match="duplicate timestep"):
+        policy.infer(_request(episode_id="ep-1", timestep=0))
+
+    after = _snapshot_state(history)
+    assert after["episode"] == before["episode"]
+    assert after["timestep"] == before["timestep"]
+    assert after["instruction"] == before["instruction"]
+    np.testing.assert_array_equal(after["committed"], before["committed"])
+    assert after["pending"] is not None and before["pending"] is not None
+    np.testing.assert_array_equal(after["pending"], before["pending"])
+    assert len(generator.calls) == calls_before
+    assert len(scorer.calls) == score_calls_before
+
+
+def test_duplicate_episode_start_immediately_after_first_request_raises() -> None:
+    policy, history, scorer, generator = _shadow_policy(candidate_count=2, seed=33)
+    policy.infer(_request(episode_id="ep-1", timestep=0))
+    before = _snapshot_state(history)
+    calls_before = len(generator.calls)
+    score_calls_before = len(scorer.calls)
+
+    with pytest.raises(ValueError, match="duplicate timestep"):
+        policy.infer(_request(episode_id="ep-1", timestep=0))
+
+    after = _snapshot_state(history)
+    assert after["episode"] == before["episode"]
+    assert after["timestep"] == before["timestep"]
+    assert after["committed"] is None and before["committed"] is None
+    assert after["pending"] is not None and before["pending"] is not None
+    np.testing.assert_array_equal(after["pending"], before["pending"])
+    assert len(generator.calls) == calls_before
+    assert len(scorer.calls) == score_calls_before
+
+
 def test_instruction_change_raises_before_generation() -> None:
     policy, history, _, generator = _shadow_policy(candidate_count=2, seed=41)
     policy.infer(_request(timestep=0, prompt="reach the peg"))

@@ -181,6 +181,8 @@ def test_active_skips_nonfinite_scores_when_finite_exists() -> None:
     assert response["returned_candidate_index"] == 1
     np.testing.assert_array_equal(np.asarray(response["actions"]), candidates[1])
     np.testing.assert_array_equal(history.pending_row, history.last_histories[1, 6])
+    # Diagnostics must not emit NaN/Inf tokens.
+    assert response["verifier_scores"] is None
 
 
 def test_active_raises_when_no_finite_scores_in_test_context() -> None:

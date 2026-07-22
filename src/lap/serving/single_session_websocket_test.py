@@ -161,9 +161,60 @@ def test_direct_and_websocket_cover_diagnostics_match() -> None:
     assert payload["verifier_authority"] == direct["verifier_authority"]
     assert payload["returned_candidate_index"] == direct["returned_candidate_index"]
     assert payload["hypothetical_selected_candidate_index"] == direct["hypothetical_selected_candidate_index"]
+    assert payload["verifier_scores"] == direct["verifier_scores"]
     assert payload["state_event"] == direct["state_event"]
     assert payload["fallback_reason"] == direct["fallback_reason"]
     assert "server_timing" in payload
+
+
+def test_websocket_partial_nonfinite_scores_match_direct_null_diagnostics() -> None:
+    request = _cover_request()
+    scores = np.asarray([np.nan, 0.8], dtype=np.float64)
+    artifact = "a" * 64
+    history = EpisodeHistoryManager(normalization=_normalization(), artifact_identity=artifact)
+    candidates = _candidate_batch(2, seed=8)
+    direct_policy = CoverPolicyWrapper(
+        authority="shadow",
+        execution_context="test",
+        candidate_count=2,
+        candidate_generator=RecordingCandidateGenerator(candidates),
+        history_manager=history,
+        scorer=FakeCoverScorer(scores=scores, compatibility=_compatibility(artifact_hash=artifact)),
+    )
+    direct = direct_policy.infer(request)
+    assert direct["verifier_scores"] is None
+    assert direct["hypothetical_selected_candidate_index"] == 1
+
+    served_history = EpisodeHistoryManager(normalization=_normalization(), artifact_identity=artifact)
+    served_policy = CoverPolicyWrapper(
+        authority="shadow",
+        execution_context="test",
+        candidate_count=2,
+        candidate_generator=RecordingCandidateGenerator(candidates),
+        history_manager=served_history,
+        scorer=FakeCoverScorer(scores=scores, compatibility=_compatibility(artifact_hash=artifact)),
+    )
+    port = _reserve_port()
+    server = SingleSessionWebsocketPolicyServer(
+        policy=served_policy,
+        host="127.0.0.1",
+        port=port,
+        metadata={"server_type": "pi05_cover"},
+        on_session_end=served_policy.reset_session,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    conn, _, packer = _wait_connect("127.0.0.1", port)
+    try:
+        conn.send(packer.pack(request))
+        payload = msgpack_numpy.unpackb(conn.recv())
+    finally:
+        conn.close()
+
+    np.testing.assert_array_equal(np.asarray(payload["actions"]), np.asarray(direct["actions"]))
+    assert payload["verifier_scores"] is None
+    assert payload["hypothetical_selected_candidate_index"] == direct["hypothetical_selected_candidate_index"]
+    assert payload["fallback_reason"] is None
 
 
 def test_second_concurrent_client_is_rejected_without_mutating_owner_state() -> None:
