@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from lap.verifiers.cover.batch_probe import build_probe_receipt
 from lap.verifiers.cover.batch_probe import compare_memory_to_baseline
+from lap.verifiers.cover.bridge_audit import build_production_target_inventory
+from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.protocol import validate_batch_probe_receipt
+from lap.verifiers.cover.w3_contracts import content_hash
 
 
 def _snapshot():
@@ -39,6 +42,7 @@ def test_memory_drift_distinguishes_stable_and_transient_fields():
 
 
 def test_probe_receipt_records_canonical_two_rank_success():
+    configuration = VerifierConfig().to_dict()
     receipt = build_probe_receipt(
         snapshot=_snapshot(),
         attempts=[
@@ -53,6 +57,12 @@ def test_probe_receipt_records_canonical_two_rank_success():
         ],
         selected_batch_size=32,
         memory_drift=compare_memory_to_baseline(_snapshot()),
+        evidence={
+            "configuration": configuration,
+            "configuration_hash": content_hash(configuration),
+            "audit_manifest_sha256": "1" * 64,
+            "target_inventory_fingerprint": build_production_target_inventory().fingerprint,
+        },
     )
 
     validate_batch_probe_receipt(receipt)

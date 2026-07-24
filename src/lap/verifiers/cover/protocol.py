@@ -419,6 +419,38 @@ def _validate_model_identity(identity: Mapping[str, Any], *, require_canonical: 
                 raise ValueError(f"batch receipt model identity missing {field}")
 
 
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def _current_lap_revision() -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(_project_root()), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+
+
+def _validate_lap_revision(recorded_revision: str) -> None:
+    current_revision = _current_lap_revision()
+    if recorded_revision == current_revision:
+        return
+    try:
+        subprocess.run(
+            ["git", "-C", str(_project_root()), "merge-base", "--is-ancestor", recorded_revision, current_revision],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        changed = subprocess.check_output(
+            ["git", "-C", str(_project_root()), "diff", "--name-only", f"{recorded_revision}..{current_revision}"],
+            text=True,
+        ).splitlines()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("batch receipt LAP revision is not an ancestor of the current checkout") from error
+    if any(not path.startswith("artifacts/w3/") for path in changed):
+        raise ValueError("batch receipt LAP revision has relevant code or environment drift")
+
+
 def _validate_environment(environment: Mapping[str, Any]) -> None:
     required = (
         "python_executable",
@@ -433,16 +465,38 @@ def _validate_environment(environment: Mapping[str, Any]) -> None:
     for field in required:
         if field not in environment:
             raise ValueError(f"batch receipt environment missing {field}")
-    if not Path(str(environment["python_executable"])).is_absolute():
+    recorded_executable = Path(str(environment["python_executable"]))
+    if not recorded_executable.is_absolute():
         raise ValueError("batch receipt must record an absolute Python executable")
-    for field in ("pyproject_sha256", "uv_lock_sha256"):
-        if not isinstance(environment[field], str) or len(environment[field]) != 64:
-            raise ValueError(f"batch receipt environment has invalid {field}")
-    if not isinstance(environment["lap_revision"], str) or len(environment["lap_revision"]) != 40:
+    if recorded_executable.resolve() != Path(sys.executable).resolve():
+        raise ValueError("batch receipt Python executable differs from the current LAP environment")
+    expected_environment = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda_build": torch.version.cuda,
+        "pyproject_sha256": sha256_file(_project_root() / "pyproject.toml"),
+        "uv_lock_sha256": sha256_file(_project_root() / "uv.lock"),
+    }
+    for field, expected in expected_environment.items():
+        if environment.get(field) != expected:
+            display = field.replace("_sha256", "").replace("_", ".")
+            raise ValueError(f"batch receipt {display} identity differs from the current LAP environment")
+    recorded_revision = environment["lap_revision"]
+    if not isinstance(recorded_revision, str) or len(recorded_revision) != 40:
         raise ValueError("batch receipt environment has invalid LAP revision")
+    _validate_lap_revision(recorded_revision)
     snapshot = environment["siglip2_snapshot"]
-    if not isinstance(snapshot, Mapping) or snapshot.get("backbone_id") != BACKBONE_ID or snapshot.get("revision") != BACKBONE_REVISION:
+    if (
+        not isinstance(snapshot, Mapping)
+        or snapshot.get("backbone_id") != BACKBONE_ID
+        or snapshot.get("revision") != BACKBONE_REVISION
+    ):
         raise ValueError("batch receipt environment does not identify the pinned SigLIP2 snapshot")
+    local_snapshot = snapshot.get("local_snapshot")
+    if local_snapshot is not None:
+        path = Path(str(local_snapshot))
+        if not path.is_dir() or path.name != BACKBONE_REVISION:
+            raise ValueError("batch receipt local SigLIP2 snapshot does not match the pinned revision")
 
 
 def probe_batch_sizes(
@@ -532,7 +586,13 @@ def probe_batch_sizes(
     raise RuntimeError("no W3 batch size fit the approved two-rank probe order")
 
 
-def validate_batch_probe_receipt(receipt: Mapping[str, Any], *, require_canonical: bool = True) -> None:
+def validate_batch_probe_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    require_canonical: bool = True,
+    expected_audit_manifest_sha256: str | None = None,
+    expected_target_inventory_fingerprint: str | None = None,
+) -> None:
     """Reject incomplete, drifted, fixture, or single-rank probe receipts."""
 
     payload = dict(receipt)
@@ -554,7 +614,30 @@ def validate_batch_probe_receipt(receipt: Mapping[str, Any], *, require_canonica
     _validate_gpu_snapshot(payload.get("gpu_snapshot", []), require_identity=require_canonical)
     if require_canonical:
         _validate_environment(payload.get("environment", {}))
-    _validate_model_identity(payload.get("model", {}), require_canonical=require_canonical)
+    model_identity = payload.get("model", {})
+    _validate_model_identity(model_identity, require_canonical=require_canonical)
+    if require_canonical:
+        from lap.verifiers.cover.bridge_audit import build_production_target_inventory  # noqa: PLC0415
+        from lap.verifiers.cover.model import VerifierConfig  # noqa: PLC0415
+
+        expected_configuration = VerifierConfig().to_dict()
+        if model_identity.get("configuration") != expected_configuration:
+            raise ValueError("batch receipt model configuration differs from the canonical verifier")
+        if model_identity.get("configuration_hash") != content_hash(expected_configuration):
+            raise ValueError("batch receipt model configuration hash differs from the canonical verifier")
+        current_fingerprint = build_production_target_inventory().fingerprint
+        if model_identity.get("target_inventory_fingerprint") != current_fingerprint:
+            raise ValueError("batch receipt target inventory fingerprint differs from the canonical verifier")
+        if (
+            expected_target_inventory_fingerprint is not None
+            and model_identity.get("target_inventory_fingerprint") != expected_target_inventory_fingerprint
+        ):
+            raise ValueError("batch receipt target inventory fingerprint differs from the supplied audit manifest")
+        if (
+            expected_audit_manifest_sha256 is not None
+            and model_identity.get("audit_manifest_sha256") != expected_audit_manifest_sha256
+        ):
+            raise ValueError("batch receipt audit manifest identity differs from the supplied audit manifest")
     selected = payload.get("selected_per_rank_batch_size")
     if selected not in PROBE_ORDER:
         raise ValueError("batch probe receipt has no approved selected batch size")
@@ -657,7 +740,13 @@ def _read_hashed_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def validate_protocol_directory(output_dir: Path, *, require_complete: bool = True) -> dict[str, Any]:
+def validate_protocol_directory(
+    output_dir: Path,
+    *,
+    require_complete: bool = True,
+    expected_audit_manifest_sha256: str | None = None,
+    expected_target_inventory_fingerprint: str | None = None,
+) -> dict[str, Any]:
     """Verify every recorded protocol/artifact hash and fixed W3 constant."""
 
     output_dir = Path(output_dir)
@@ -713,7 +802,12 @@ def validate_protocol_directory(output_dir: Path, *, require_complete: bool = Tr
         raise ValueError("shuffled pair count drifted")
     if len(materialized["nearby_pairs"].get("pairs", [])) != VALIDATION_COUNT:
         raise ValueError("nearby pair count drifted")
-    validate_batch_probe_receipt(materialized["batch_probe_receipt"], require_canonical=require_complete)
+    validate_batch_probe_receipt(
+        materialized["batch_probe_receipt"],
+        require_canonical=require_complete,
+        expected_audit_manifest_sha256=expected_audit_manifest_sha256,
+        expected_target_inventory_fingerprint=expected_target_inventory_fingerprint,
+    )
     if require_complete and payload.get("status") != "complete":
         raise ValueError("W3 protocol is incomplete pending the real two-rank batch probe")
     selected = payload.get("batch", {}).get("per_rank")

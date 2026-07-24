@@ -205,7 +205,12 @@ def preflight_w3(
     audit = _audit_manifest(Path(audit_manifest), Path(bridge_artifact), allow_fixture=fixture)
     protocol_receipt = None
     if protocol_dir is not None:
-        protocol_receipt = validate_protocol_directory(Path(protocol_dir), require_complete=True)
+        protocol_receipt = validate_protocol_directory(
+            Path(protocol_dir),
+            require_complete=True,
+            expected_audit_manifest_sha256=audit["manifest_sha256"],
+            expected_target_inventory_fingerprint=audit["target"]["fingerprint"],
+        )
         recorded_train_hash = protocol_receipt["protocol"]["identities"].get("train_manifest_hash")
         if recorded_train_hash != dataset.train_manifest_hash:
             raise ValueError("protocol train manifest identity does not match the W2 package")

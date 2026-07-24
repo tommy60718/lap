@@ -30,6 +30,10 @@ class VerifierConfig:
     history_length: int = 10
     action_width: int = 7
     use_wrist: bool = True
+    text_aware_extraction_contract: str = "bridge_clearclip_v1"
+    trajectory_activation: str = "relu"
+    trajectory_position_contract: str = "sinusoidal_v1"
+    attention_pooling_contract: str = "lap_fresh_attention_pool_v1"
 
     @property
     def fusion_input_width(self) -> int:
@@ -47,6 +51,10 @@ class VerifierConfig:
             "history_length": self.history_length,
             "action_width": self.action_width,
             "use_wrist": self.use_wrist,
+            "text_aware_extraction_contract": self.text_aware_extraction_contract,
+            "trajectory_activation": self.trajectory_activation,
+            "trajectory_position_contract": self.trajectory_position_contract,
+            "attention_pooling_contract": self.attention_pooling_contract,
             "backbone_id": BACKBONE_ID,
             "backbone_revision": BACKBONE_REVISION,
         }
@@ -124,6 +132,14 @@ class VerifierModel(nn.Module):
 
     def __init__(self, config: VerifierConfig, backbone: nn.Module) -> None:
         super().__init__()
+        if config.text_aware_extraction_contract != "bridge_clearclip_v1":
+            raise ValueError("unsupported text-aware extraction contract")
+        if config.trajectory_activation != "relu":
+            raise ValueError("unsupported trajectory activation contract")
+        if config.trajectory_position_contract != "sinusoidal_v1":
+            raise ValueError("unsupported trajectory position contract")
+        if config.attention_pooling_contract != "lap_fresh_attention_pool_v1":
+            raise ValueError("unsupported attention pooling contract")
         if config.history_length != HISTORY_SHAPE[0] or config.action_width != HISTORY_SHAPE[1]:
             raise ValueError("W3 model requires float32[10, 7] histories")
         self.config = config
@@ -158,6 +174,7 @@ class VerifierModel(nn.Module):
             d_model=config.embedding_width,
             nhead=config.num_heads,
             dim_feedforward=config.feed_forward_width,
+            activation=config.trajectory_activation,
             batch_first=False,
             dropout=0.1,
         )

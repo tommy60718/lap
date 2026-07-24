@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 from torch.utils.data.distributed import DistributedSampler
 
+from lap.verifiers.cover.bridge_audit import build_production_target_inventory
+from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.protocol import APPROVED_SHUFFLED_EXCLUSIONS
 from lap.verifiers.cover.protocol import EVALUATION_SEED
 from lap.verifiers.cover.protocol import PROBE_ORDER
@@ -19,13 +21,50 @@ from lap.verifiers.cover.protocol import materialize_protocol
 from lap.verifiers.cover.protocol import probe_batch_sizes
 from lap.verifiers.cover.protocol import sampler_indices
 from lap.verifiers.cover.protocol import select_training_phrase
+from lap.verifiers.cover.protocol import validate_batch_probe_receipt
 from lap.verifiers.cover.protocol import validate_protocol_directory
+from lap.verifiers.cover.w3_contracts import content_hash
 
 CANONICAL_EXPORT = Path(__file__).resolve().parents[6] / ".w2_canonical_export_v3"
 
 
 def _canonical_validation_rows():
     return json.loads((CANONICAL_EXPORT / "validation_samples.json").read_text(encoding="utf-8"))
+
+
+def _canonical_model_identity(*, audit_manifest_sha256: str = "1" * 64):
+    configuration = VerifierConfig().to_dict()
+    return {
+        "backbone": "hf-hub:timm/ViT-L-16-SigLIP2-384",
+        "canonical_target": True,
+        "configuration": configuration,
+        "configuration_hash": content_hash(configuration),
+        "audit_manifest_sha256": audit_manifest_sha256,
+        "target_inventory_fingerprint": build_production_target_inventory().fingerprint,
+    }
+
+
+def _canonical_gpu_snapshots():
+    return [
+        {
+            "index": 0,
+            "name": "NVIDIA RTX 6000 Ada Generation",
+            "driver_version": "570.124.06",
+            "uuid": "GPU-test-0",
+            "physical_total_memory_mib": 49140,
+            "allocatable_total_memory_mib": 48502,
+            "free_memory_mib": 47000,
+        },
+        {
+            "index": 1,
+            "name": "NVIDIA RTX 6000 Ada Generation",
+            "driver_version": "570.124.06",
+            "uuid": "GPU-test-1",
+            "physical_total_memory_mib": 49140,
+            "allocatable_total_memory_mib": 48510,
+            "free_memory_mib": 47100,
+        },
+    ]
 
 
 def test_phrase_manifest_has_exact_approved_bank():
@@ -106,13 +145,13 @@ def test_batch_probe_records_two_gpu_attempts_and_first_success():
     receipt = probe_batch_sizes(
         step,
         snapshot_fn=lambda: snapshots,
-            model_identity={
-                "backbone": "hf-hub:timm/ViT-L-16-SigLIP2-384",
-                "canonical_target": True,
-                "configuration_hash": "0" * 64,
-                "audit_manifest_sha256": "1" * 64,
-                "target_inventory_fingerprint": "2" * 64,
-            },
+        model_identity={
+            "backbone": "hf-hub:timm/ViT-L-16-SigLIP2-384",
+            "canonical_target": True,
+            "configuration_hash": "0" * 64,
+            "audit_manifest_sha256": "1" * 64,
+            "target_inventory_fingerprint": "2" * 64,
+        },
     )
     assert receipt["attempted_batch_sizes"] == list(PROBE_ORDER[:2])
     assert receipt["selected_per_rank_batch_size"] == 32
@@ -126,19 +165,19 @@ def test_tiny_probe_cannot_be_materialized_as_canonical(tmp_path):
         lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
         snapshot_fn=lambda: [
             {
-                    "index": 0,
-                    "name": "fixture",
-                    "driver_version": "test",
-                    "uuid": "GPU-test-0",
+                "index": 0,
+                "name": "fixture",
+                "driver_version": "test",
+                "uuid": "GPU-test-0",
                 "physical_total_memory_mib": 1,
                 "allocatable_total_memory_mib": 1,
                 "free_memory_mib": 1,
             },
             {
-                    "index": 1,
-                    "name": "fixture",
-                    "driver_version": "test",
-                    "uuid": "GPU-test-1",
+                "index": 1,
+                "name": "fixture",
+                "driver_version": "test",
+                "uuid": "GPU-test-1",
                 "physical_total_memory_mib": 1,
                 "allocatable_total_memory_mib": 1,
                 "free_memory_mib": 1,
@@ -158,33 +197,8 @@ def test_tiny_probe_cannot_be_materialized_as_canonical(tmp_path):
 def test_materialized_protocol_is_hashable_and_rejects_drift(tmp_path):
     receipt = probe_batch_sizes(
         lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
-        snapshot_fn=lambda: [
-            {
-                    "index": 0,
-                    "name": "NVIDIA RTX 6000 Ada Generation",
-                    "driver_version": "570.124.06",
-                    "uuid": "GPU-test-0",
-                "physical_total_memory_mib": 49140,
-                "allocatable_total_memory_mib": 48502,
-                "free_memory_mib": 47000,
-            },
-            {
-                    "index": 1,
-                    "name": "NVIDIA RTX 6000 Ada Generation",
-                    "driver_version": "570.124.06",
-                    "uuid": "GPU-test-1",
-                "physical_total_memory_mib": 49140,
-                "allocatable_total_memory_mib": 48510,
-                "free_memory_mib": 47100,
-            },
-        ],
-        model_identity={
-            "backbone": "hf-hub:timm/ViT-L-16-SigLIP2-384",
-            "canonical_target": True,
-            "configuration_hash": "0" * 64,
-            "audit_manifest_sha256": "1" * 64,
-            "target_inventory_fingerprint": "2" * 64,
-        },
+        snapshot_fn=_canonical_gpu_snapshots,
+        model_identity=_canonical_model_identity(),
     )
     materialize_protocol(
         tmp_path,
@@ -203,3 +217,33 @@ def test_materialized_protocol_is_hashable_and_rejects_drift(tmp_path):
     run_protocol.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match=r"hash|protocol|seed"):
         validate_protocol_directory(tmp_path)
+
+
+def test_canonical_batch_receipt_rejects_rehashed_identity_drift():
+    receipt = probe_batch_sizes(
+        lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
+        snapshot_fn=_canonical_gpu_snapshots,
+        model_identity=_canonical_model_identity(),
+    )
+
+    receipt["environment"]["uv_lock_sha256"] = "f" * 64
+    unsigned = {key: value for key, value in receipt.items() if key != "content_hash"}
+    receipt["content_hash"] = content_hash(unsigned)
+
+    with pytest.raises(ValueError, match=r"uv.lock"):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
+
+
+def test_canonical_batch_receipt_must_match_supplied_audit():
+    receipt = probe_batch_sizes(
+        lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
+        snapshot_fn=_canonical_gpu_snapshots,
+        model_identity=_canonical_model_identity(audit_manifest_sha256="a" * 64),
+    )
+
+    with pytest.raises(ValueError, match="audit manifest"):
+        validate_batch_probe_receipt(
+            receipt,
+            require_canonical=True,
+            expected_audit_manifest_sha256="b" * 64,
+        )

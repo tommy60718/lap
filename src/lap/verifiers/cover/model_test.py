@@ -60,6 +60,22 @@ def test_trajectory_encoder_uses_bridge_default_relu_activation():
     assert model.trajectory_encoder.layers[0].activation.__name__ == "relu"
 
 
+def test_verifier_config_fingerprint_includes_semantic_behavior_contracts():
+    config = VerifierConfig().to_dict()
+
+    assert config["text_aware_extraction_contract"] == "bridge_clearclip_v1"
+    assert config["trajectory_activation"] == "relu"
+    assert config["trajectory_position_contract"] == "sinusoidal_v1"
+    assert config["attention_pooling_contract"] == "lap_fresh_attention_pool_v1"
+
+
+def test_model_rejects_unimplemented_semantic_contract():
+    config = VerifierConfig(trajectory_activation="gelu")
+
+    with pytest.raises(ValueError, match="trajectory activation"):
+        VerifierModel(config, TinyFrozenBackbone(width=1024, tokens=576))
+
+
 def test_backbone_is_frozen_but_verifier_step_has_trainable_gradients():
     model = _model()
     base, histories, instructions = _batch()
