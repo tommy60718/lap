@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import platform
 import subprocess
+import sys
 from typing import Any
 import unicodedata
 
@@ -340,29 +341,40 @@ def snapshot_nvidia_devices() -> list[dict[str, Any]]:
         physical_rows = subprocess.check_output(
             [
                 "nvidia-smi",
-                "--query-gpu=index,memory.total",
+                "--query-gpu=index,name,driver_version,uuid,memory.total",
                 "--format=csv,noheader,nounits",
             ],
             text=True,
         ).splitlines()
-        physical_memory = {
-            int(row.split(",", 1)[0].strip()): float(row.split(",", 1)[1].strip())
-            for row in physical_rows
-            if row.strip()
-        }
+        physical_devices = {}
+        for row in physical_rows:
+            if not row.strip():
+                continue
+            fields = [field.strip() for field in row.split(",")]
+            if len(fields) != 5:
+                raise ValueError("unexpected nvidia-smi GPU identity row")
+            physical_devices[int(fields[0])] = {
+                "name": fields[1],
+                "driver_version": fields[2],
+                "uuid": fields[3],
+                "physical_total_memory_mib": float(fields[4]),
+            }
     except (OSError, subprocess.CalledProcessError, ValueError) as error:
         raise RuntimeError("W3 batch probe could not remeasure physical GPU memory with nvidia-smi") from error
     snapshots = []
     for index in range(WORLD_SIZE):
         free_bytes, allocatable_bytes = torch.cuda.mem_get_info(index)
         properties = torch.cuda.get_device_properties(index)
-        if index not in physical_memory:
+        if index not in physical_devices:
             raise RuntimeError(f"nvidia-smi did not report physical memory for GPU {index}")
+        physical = physical_devices[index]
         snapshots.append(
             {
                 "index": index,
-                "name": properties.name,
-                "physical_total_memory_mib": physical_memory[index],
+                "name": physical["name"] or properties.name,
+                "driver_version": physical["driver_version"],
+                "uuid": physical["uuid"],
+                "physical_total_memory_mib": physical["physical_total_memory_mib"],
                 "allocatable_total_memory_mib": allocatable_bytes / (1024**2),
                 "free_memory_mib": free_bytes / (1024**2),
             }
@@ -375,13 +387,17 @@ def _is_oom(error: BaseException) -> bool:
     return isinstance(error, MemoryError) or "out of memory" in message or "cuda error: out of memory" in message
 
 
-def _validate_gpu_snapshot(snapshot: Sequence[Mapping[str, Any]]) -> None:
+def _validate_gpu_snapshot(snapshot: Sequence[Mapping[str, Any]], *, require_identity: bool = False) -> None:
     if len(snapshot) != WORLD_SIZE:
         raise ValueError("batch probe must record both GPUs")
     for gpu in snapshot:
         for key in ("index", "name", "physical_total_memory_mib", "allocatable_total_memory_mib", "free_memory_mib"):
             if key not in gpu:
                 raise ValueError(f"GPU probe snapshot missing {key}")
+        if require_identity:
+            for key in ("driver_version", "uuid"):
+                if not isinstance(gpu.get(key), str) or not gpu[key]:
+                    raise ValueError(f"GPU probe snapshot missing {key}")
         if gpu["physical_total_memory_mib"] < gpu["allocatable_total_memory_mib"]:
             raise ValueError("allocatable GPU memory cannot exceed physical memory")
 
@@ -397,6 +413,36 @@ def _validate_model_identity(identity: Mapping[str, Any], *, require_canonical: 
             raise ValueError("batch receipt must identify the pinned SigLIP2 backbone")
         if identity.get("backbone_revision") not in {None, BACKBONE_REVISION}:
             raise ValueError("batch receipt backbone revision drifted")
+        for field in ("configuration_hash", "audit_manifest_sha256", "target_inventory_fingerprint"):
+            value = identity.get(field)
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"batch receipt model identity missing {field}")
+
+
+def _validate_environment(environment: Mapping[str, Any]) -> None:
+    required = (
+        "python_executable",
+        "python",
+        "torch",
+        "cuda_build",
+        "lap_revision",
+        "pyproject_sha256",
+        "uv_lock_sha256",
+        "siglip2_snapshot",
+    )
+    for field in required:
+        if field not in environment:
+            raise ValueError(f"batch receipt environment missing {field}")
+    if not Path(str(environment["python_executable"])).is_absolute():
+        raise ValueError("batch receipt must record an absolute Python executable")
+    for field in ("pyproject_sha256", "uv_lock_sha256"):
+        if not isinstance(environment[field], str) or len(environment[field]) != 64:
+            raise ValueError(f"batch receipt environment has invalid {field}")
+    if not isinstance(environment["lap_revision"], str) or len(environment["lap_revision"]) != 40:
+        raise ValueError("batch receipt environment has invalid LAP revision")
+    snapshot = environment["siglip2_snapshot"]
+    if not isinstance(snapshot, Mapping) or snapshot.get("backbone_id") != BACKBONE_ID or snapshot.get("revision") != BACKBONE_REVISION:
+        raise ValueError("batch receipt environment does not identify the pinned SigLIP2 snapshot")
 
 
 def probe_batch_sizes(
@@ -419,6 +465,19 @@ def probe_batch_sizes(
     _validate_gpu_snapshot(gpu_snapshot)
     identity = dict(model_identity or {"backbone": BACKBONE_ID, "backbone_revision": BACKBONE_REVISION})
     _validate_model_identity(identity, require_canonical=False)
+    project_root = Path(__file__).resolve().parents[4]
+    environment = {
+        "python_executable": sys.executable,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda_build": torch.version.cuda,
+        "lap_revision": subprocess.check_output(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"], text=True
+        ).strip(),
+        "pyproject_sha256": sha256_file(project_root / "pyproject.toml"),
+        "uv_lock_sha256": sha256_file(project_root / "uv.lock"),
+        "siglip2_snapshot": {"backbone_id": BACKBONE_ID, "revision": BACKBONE_REVISION},
+    }
     attempts = []
     for batch_size in PROBE_ORDER:
         rank_results = []
@@ -464,6 +523,7 @@ def probe_batch_sizes(
                 "selected_per_rank_batch_size": batch_size,
                 "selection_rule": "first_successful_two_rank_forward_backward",
                 "gpu_snapshot": gpu_snapshot,
+                "environment": environment,
                 "model": _jsonable(identity),
                 "successful_two_rank_forward_backward": {"batch_size": batch_size, "ranks": [0, 1]},
                 "attempts": attempts,
@@ -491,7 +551,9 @@ def validate_batch_probe_receipt(receipt: Mapping[str, Any], *, require_canonica
         raise ValueError("batch probe receipt is incomplete or has the wrong schema")
     if payload.get("world_size") != WORLD_SIZE or payload.get("probe_order") != list(PROBE_ORDER):
         raise ValueError("batch probe receipt has drifted world-size or probe order")
-    _validate_gpu_snapshot(payload.get("gpu_snapshot", []))
+    _validate_gpu_snapshot(payload.get("gpu_snapshot", []), require_identity=require_canonical)
+    if require_canonical:
+        _validate_environment(payload.get("environment", {}))
     _validate_model_identity(payload.get("model", {}), require_canonical=require_canonical)
     selected = payload.get("selected_per_rank_batch_size")
     if selected not in PROBE_ORDER:

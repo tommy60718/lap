@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from lap.verifiers.cover.model import TextAwareVisualExtraction
 from lap.verifiers.cover.model import TinyFrozenBackbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
@@ -38,6 +39,25 @@ def test_two_view_forward_has_normalized_embeddings_and_finite_logits():
     assert torch.allclose(output["semantic_embedding"].norm(dim=-1), torch.ones(3), atol=1e-5)
     assert torch.allclose(output["action_embedding"].norm(dim=-1), torch.ones(3), atol=1e-5)
     assert torch.isfinite(output["semantic_to_action_logits"]).all()
+
+
+def test_text_aware_extraction_matches_bridge_text_conditioning_contract():
+    extractor = TextAwareVisualExtraction(width=4, tokens=3)
+    visual = torch.tensor([[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]])
+    first_text = torch.tensor([[[1.0, 0.0, 0.0, 0.0]]])
+    second_text = torch.tensor([[[0.0, 1.0, 0.0, 0.0]]])
+
+    first = extractor(visual, first_text)
+    second = extractor(visual, second_text)
+
+    assert first.shape == (1, 1, 4)
+    assert second.shape == (1, 1, 4)
+    assert not torch.allclose(first, second)
+
+
+def test_trajectory_encoder_uses_bridge_default_relu_activation():
+    model = _model()
+    assert model.trajectory_encoder.layers[0].activation.__name__ == "relu"
 
 
 def test_backbone_is_frozen_but_verifier_step_has_trainable_gradients():

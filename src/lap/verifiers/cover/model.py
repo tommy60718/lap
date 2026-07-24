@@ -97,18 +97,26 @@ class AttentionPool(nn.Module):
 class TextAwareVisualExtraction(nn.Module):
     def __init__(self, *, width: int, tokens: int) -> None:
         super().__init__()
-        self.temperature = nn.Parameter(torch.tensor(1.0))
-        self.register_buffer("pos_emb", torch.zeros(tokens, width), persistent=True)
+        self.temperature = nn.Parameter(torch.tensor(0.07))
+        position = torch.arange(tokens, dtype=torch.float32)
+        inv_frequency = 1.0 / (10000 ** (torch.arange(0, width, 2, dtype=torch.float32) / width))
+        sinusoid = torch.einsum("i,j->ij", position, inv_frequency)
+        self.register_buffer("pos_emb", torch.cat((sinusoid.sin(), sinusoid.cos()), dim=-1), persistent=True)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        if tokens.ndim != 3:
-            raise ValueError("backbone tokens must have shape [batch, sequence, width]")
+    def forward(self, tokens: torch.Tensor, text_features: torch.Tensor) -> torch.Tensor:
+        if tokens.ndim != 3 or text_features.ndim != 3:
+            raise ValueError("visual and text features must have shape [batch, sequence, width]")
+        if tokens.shape[0] != text_features.shape[0] or tokens.shape[2] != text_features.shape[2]:
+            raise ValueError("visual and text features must have matching batch and width dimensions")
         position = self.pos_emb
         if tokens.shape[1] != position.shape[0]:
             position = F.interpolate(position.T.unsqueeze(0), size=tokens.shape[1], mode="linear", align_corners=False)[
                 0
             ].T
-        return tokens + position.to(device=tokens.device, dtype=tokens.dtype) * self.temperature.to(tokens.dtype)
+        visual = tokens + position.to(device=tokens.device, dtype=tokens.dtype)
+        similarity = torch.einsum("bij,bkj->bik", text_features, tokens)
+        attention = F.softmax(similarity / self.temperature.clamp(0, 100), dim=-1)
+        return torch.einsum("bik,bkj->bij", attention, visual)
 
 
 class VerifierModel(nn.Module):
@@ -150,7 +158,6 @@ class VerifierModel(nn.Module):
             d_model=config.embedding_width,
             nhead=config.num_heads,
             dim_feedforward=config.feed_forward_width,
-            activation="gelu",
             batch_first=False,
             dropout=0.1,
         )
@@ -193,12 +200,12 @@ class VerifierModel(nn.Module):
             if wrist_tokens is not None:
                 wrist_tokens = wrist_tokens.float()
             text_tokens = text_tokens.float()
-        base_tokens = self.text_aware_visual_extraction(base_tokens)
+        base_tokens = self.text_aware_visual_extraction(base_tokens, text_tokens)
         base_feature = self.vision_poolings(base_tokens.transpose(0, 1))
         features = [base_feature]
         if self.config.use_wrist:
             assert wrist_tokens is not None
-            wrist_tokens = self.text_aware_visual_extraction(wrist_tokens)
+            wrist_tokens = self.text_aware_visual_extraction(wrist_tokens, text_tokens)
             features.append(self.vision_poolings(wrist_tokens.transpose(0, 1)))
         text_feature = self.text_pooling(text_tokens.transpose(0, 1))
         features.append(text_feature)

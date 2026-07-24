@@ -10,6 +10,8 @@ def _snapshot():
         {
             "index": 0,
             "name": "NVIDIA RTX 6000 Ada Generation",
+            "driver_version": "570.124.06",
+            "uuid": "GPU-test-0",
             "physical_total_memory_mib": 49140.0,
             "allocatable_total_memory_mib": 48502.69,
             "free_memory_mib": 47800.0,
@@ -17,6 +19,8 @@ def _snapshot():
         {
             "index": 1,
             "name": "NVIDIA RTX 6000 Ada Generation",
+            "driver_version": "570.124.06",
+            "uuid": "GPU-test-1",
             "physical_total_memory_mib": 49140.0,
             "allocatable_total_memory_mib": 48510.94,
             "free_memory_mib": 48000.0,

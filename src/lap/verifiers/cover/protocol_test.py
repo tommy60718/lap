@@ -106,7 +106,13 @@ def test_batch_probe_records_two_gpu_attempts_and_first_success():
     receipt = probe_batch_sizes(
         step,
         snapshot_fn=lambda: snapshots,
-        model_identity={"backbone": "hf-hub:timm/ViT-L-16-SigLIP2-384", "canonical_target": True},
+            model_identity={
+                "backbone": "hf-hub:timm/ViT-L-16-SigLIP2-384",
+                "canonical_target": True,
+                "configuration_hash": "0" * 64,
+                "audit_manifest_sha256": "1" * 64,
+                "target_inventory_fingerprint": "2" * 64,
+            },
     )
     assert receipt["attempted_batch_sizes"] == list(PROBE_ORDER[:2])
     assert receipt["selected_per_rank_batch_size"] == 32
@@ -120,15 +126,19 @@ def test_tiny_probe_cannot_be_materialized_as_canonical(tmp_path):
         lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
         snapshot_fn=lambda: [
             {
-                "index": 0,
-                "name": "fixture",
+                    "index": 0,
+                    "name": "fixture",
+                    "driver_version": "test",
+                    "uuid": "GPU-test-0",
                 "physical_total_memory_mib": 1,
                 "allocatable_total_memory_mib": 1,
                 "free_memory_mib": 1,
             },
             {
-                "index": 1,
-                "name": "fixture",
+                    "index": 1,
+                    "name": "fixture",
+                    "driver_version": "test",
+                    "uuid": "GPU-test-1",
                 "physical_total_memory_mib": 1,
                 "allocatable_total_memory_mib": 1,
                 "free_memory_mib": 1,
@@ -150,21 +160,31 @@ def test_materialized_protocol_is_hashable_and_rejects_drift(tmp_path):
         lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
         snapshot_fn=lambda: [
             {
-                "index": 0,
-                "name": "NVIDIA RTX 6000 Ada Generation",
+                    "index": 0,
+                    "name": "NVIDIA RTX 6000 Ada Generation",
+                    "driver_version": "570.124.06",
+                    "uuid": "GPU-test-0",
                 "physical_total_memory_mib": 49140,
                 "allocatable_total_memory_mib": 48502,
                 "free_memory_mib": 47000,
             },
             {
-                "index": 1,
-                "name": "NVIDIA RTX 6000 Ada Generation",
+                    "index": 1,
+                    "name": "NVIDIA RTX 6000 Ada Generation",
+                    "driver_version": "570.124.06",
+                    "uuid": "GPU-test-1",
                 "physical_total_memory_mib": 49140,
                 "allocatable_total_memory_mib": 48510,
                 "free_memory_mib": 47100,
             },
         ],
-        model_identity={"backbone": "hf-hub:timm/ViT-L-16-SigLIP2-384", "canonical_target": True},
+        model_identity={
+            "backbone": "hf-hub:timm/ViT-L-16-SigLIP2-384",
+            "canonical_target": True,
+            "configuration_hash": "0" * 64,
+            "audit_manifest_sha256": "1" * 64,
+            "target_inventory_fingerprint": "2" * 64,
+        },
     )
     materialize_protocol(
         tmp_path,

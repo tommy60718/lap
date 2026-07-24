@@ -29,6 +29,7 @@ def _artifact(tmp_path, *, components=3, extra=None):
         "input_projection.weight": torch.ones(2, 2),
         "text_aware_visual_extraction.pos_emb": torch.ones(3, 2),
         "action_padding_value": -5.0,
+        "trajectory_encoder.weight": torch.ones(2, 2),
     }
     if extra:
         selected.update(extra)
@@ -56,6 +57,7 @@ def test_audit_classifies_each_source_and_target_once(tmp_path):
     path = _artifact(tmp_path)
     target = {
         "text_pooling.weight": torch.zeros(2, 2),
+        "trajectory_encoder.weight": torch.zeros(2, 2),
         "text_aware_visual_extraction.pos_emb": torch.zeros(3, 2),
         "semantic_fusion.weight": torch.zeros(2, 2),
     }
@@ -67,12 +69,12 @@ def test_audit_classifies_each_source_and_target_once(tmp_path):
     assert len({entry["key"] for entry in target_entries}) == len(target_entries)
     assert {entry["key"] for entry in target_entries} == set(target)
     assert (
-        "ensemble_components[0].text_pooling.weight",
+        "ensemble_components[0].trajectory_encoder.weight",
         "transferred",
         "allowlisted_exact_match",
     ) in {(entry["key"], entry["state"], entry["reason"]) for entry in source_entries}
     assert (
-        "text_pooling.weight",
+        "trajectory_encoder.weight",
         "transferred",
         "allowlisted_exact_match",
     ) in {(entry["key"], entry["state"], entry["reason"]) for entry in target_entries}
@@ -81,6 +83,16 @@ def test_audit_classifies_each_source_and_target_once(tmp_path):
         "rejected",
         "forbidden_single_view_fusion",
     ) in {(entry["key"], entry["state"], entry["reason"]) for entry in source_entries}
+    assert (
+        "ensemble_components[0].text_pooling.weight",
+        "rejected",
+        "semantic_role_mismatch_pooling_implementation",
+    ) in {(entry["key"], entry["state"], entry["reason"]) for entry in source_entries}
+    assert (
+        "text_pooling.weight",
+        "fresh",
+        "fresh_due_to_semantic_role_mismatch",
+    ) in {(entry["key"], entry["state"], entry["reason"]) for entry in target_entries}
     assert (
         "ensemble_components[0].text_aware_visual_extraction.pos_emb",
         "rejected",
@@ -156,12 +168,16 @@ def test_audit_rejects_dtype_mismatch_before_transfer(tmp_path):
     )
     entry = next(entry for entry in manifest["entries"] if entry["key"] == "ensemble_components[0].text_pooling.weight")
     assert entry["state"] == "rejected"
-    assert entry["reason"] == "dtype_mismatch"
+    assert entry["reason"] == "semantic_role_mismatch_pooling_implementation"
 
 
 def test_apply_rejects_changed_target_inventory_before_copy(tmp_path):
     path = _artifact(tmp_path)
-    target = {"text_pooling.weight": torch.zeros(2, 2), "semantic_fusion.weight": torch.zeros(2, 2)}
+    target = {
+        "text_pooling.weight": torch.zeros(2, 2),
+        "trajectory_encoder.weight": torch.zeros(2, 2),
+        "semantic_fusion.weight": torch.zeros(2, 2),
+    }
     manifest = audit_bridge_checkpoint(path, target_inventory=_inventory(target), **_identity_kwargs(path))
     changed = _inventory({**target, "new_target.weight": torch.zeros(2, 2)})
     model = _ToyVerifier()
@@ -175,7 +191,11 @@ def test_apply_rejects_changed_target_inventory_before_copy(tmp_path):
 
 def test_apply_validates_all_transfers_before_copying(tmp_path):
     path = _artifact(tmp_path)
-    target = {"text_pooling.weight": torch.zeros(2, 2), "semantic_fusion.weight": torch.zeros(2, 2)}
+    target = {
+        "text_pooling.weight": torch.zeros(2, 2),
+        "trajectory_encoder.weight": torch.zeros(2, 2),
+        "semantic_fusion.weight": torch.zeros(2, 2),
+    }
     manifest = audit_bridge_checkpoint(path, target_inventory=_inventory(target), **_identity_kwargs(path))
     tampered = copy.deepcopy(manifest)
     transfer = next(

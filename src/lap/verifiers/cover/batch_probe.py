@@ -28,6 +28,7 @@ from lap.verifiers.cover.protocol import snapshot_nvidia_devices
 from lap.verifiers.cover.w3_contracts import BACKBONE_ID
 from lap.verifiers.cover.w3_contracts import BACKBONE_REVISION
 from lap.verifiers.cover.w3_contracts import content_hash
+from lap.verifiers.cover.w3_contracts import sha256_file
 from lap.verifiers.cover.w3_contracts import write_canonical_json
 
 WORLD_SIZE = 2
@@ -90,20 +91,46 @@ def build_probe_receipt(
     selected_batch_size: int,
     memory_drift: Mapping[str, Any],
     host: str | None = None,
+    evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the hashable canonical receipt after a successful DDP probe."""
 
     if selected_batch_size not in PROBE_ORDER:
         raise ValueError("selected batch size is outside the approved W3 probe order")
+    selected_evidence = dict(evidence or {})
+    environment = {
+        "python_executable": selected_evidence.get("python_executable", sys.executable),
+        "python": selected_evidence.get("python", platform.python_version()),
+        "torch": selected_evidence.get("torch", torch.__version__),
+        "cuda_build": selected_evidence.get("cuda_build", torch.version.cuda),
+        "lap_revision": selected_evidence.get("lap_revision", _git_revision()),
+        "pyproject_sha256": selected_evidence.get("pyproject_sha256", _project_file_hash("pyproject.toml")),
+        "uv_lock_sha256": selected_evidence.get("uv_lock_sha256", _project_file_hash("uv.lock")),
+        "siglip2_snapshot": selected_evidence.get(
+            "siglip2_snapshot",
+            {"backbone_id": BACKBONE_ID, "revision": BACKBONE_REVISION},
+        ),
+    }
+    model_provenance = {
+        "canonical_target": True,
+        "backbone": BACKBONE_ID,
+        "backbone_revision": BACKBONE_REVISION,
+        "configuration": selected_evidence.get("configuration", VerifierConfig().to_dict()),
+        "configuration_hash": selected_evidence.get(
+            "configuration_hash", content_hash(VerifierConfig().to_dict())
+        ),
+        "audit_manifest_sha256": selected_evidence.get("audit_manifest_sha256", "0" * 64),
+        "target_inventory_fingerprint": selected_evidence.get("target_inventory_fingerprint", "0" * 64),
+        "two_view": True,
+        "trainable_dtype": "float32",
+        "frozen_backbone_dtype": "bfloat16",
+        "automatic_mixed_precision": False,
+    }
     payload = {
         "schema": "osx_cover_w3_batch_probe_v2",
         "status": "complete",
         "host": host or platform.node(),
-        "environment": {
-            "python": platform.python_version(),
-            "torch": torch.__version__,
-            "cuda_build": torch.version.cuda,
-        },
+        "environment": environment,
         "world_size": WORLD_SIZE,
         "probe_order": list(PROBE_ORDER),
         "attempted_batch_sizes": [attempt["per_rank_batch_size"] for attempt in attempts],
@@ -111,20 +138,49 @@ def build_probe_receipt(
         "selection_rule": "first_successful_two_rank_forward_backward",
         "gpu_snapshot": [dict(gpu) for gpu in snapshot],
         "memory_drift": dict(memory_drift),
-        "model": {
-            "canonical_target": True,
-            "backbone": BACKBONE_ID,
-            "backbone_revision": BACKBONE_REVISION,
-            "two_view": True,
-            "trainable_dtype": "float32",
-            "frozen_backbone_dtype": "bfloat16",
-            "automatic_mixed_precision": False,
-        },
+        "model": model_provenance,
         "attempts": [dict(attempt) for attempt in attempts],
         "successful_two_rank_forward_backward": {"batch_size": selected_batch_size, "ranks": [0, 1]},
     }
     payload["content_hash"] = content_hash(payload)
     return payload
+
+
+def _git_revision() -> str:
+    root = Path(__file__).resolve().parents[4]
+    try:
+        return subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unavailable"
+
+
+def _project_file_hash(filename: str) -> str:
+    root = Path(__file__).resolve().parents[4]
+    path = root / filename
+    return sha256_file(path) if path.is_file() else "unavailable"
+
+
+def _canonical_probe_evidence(*, model_dir: Path, audit_manifest: Path) -> dict[str, Any]:
+    manifest = json.loads(Path(audit_manifest).read_text(encoding="utf-8"))
+    configuration = VerifierConfig().to_dict()
+    return {
+        "python_executable": sys.executable,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda_build": torch.version.cuda,
+        "lap_revision": _git_revision(),
+        "pyproject_sha256": _project_file_hash("pyproject.toml"),
+        "uv_lock_sha256": _project_file_hash("uv.lock"),
+        "siglip2_snapshot": {
+            "backbone_id": BACKBONE_ID,
+            "revision": BACKBONE_REVISION,
+            "local_snapshot": str(Path(model_dir).resolve()),
+        },
+        "configuration": configuration,
+        "configuration_hash": content_hash(configuration),
+        "audit_manifest_sha256": manifest["manifest_sha256"],
+        "target_inventory_fingerprint": manifest["target"]["fingerprint"],
+    }
 
 
 def _is_oom(error: BaseException | str) -> bool:
@@ -312,6 +368,7 @@ def run_real_batch_probe(
     snapshot = snapshot_nvidia_devices()
     memory_drift = compare_memory_to_baseline(snapshot)
     model_dir = _resolve_pinned_snapshot()
+    evidence = _canonical_probe_evidence(model_dir=model_dir, audit_manifest=audit_manifest)
     attempts: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="osx-cover-w3-probe-") as temporary:
         for batch_size in PROBE_ORDER:
@@ -366,6 +423,7 @@ def run_real_batch_probe(
                 attempts=attempts,
                 selected_batch_size=batch_size,
                 memory_drift=memory_drift,
+                evidence=evidence,
             )
             write_canonical_json(Path(output_path), receipt)
             return receipt

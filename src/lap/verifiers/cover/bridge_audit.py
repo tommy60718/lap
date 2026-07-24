@@ -26,9 +26,11 @@ BRIDGE_ARTIFACT_FORMAT = "torch_weights_only_ensemble_components_v1"
 CANONICAL_TARGET_KIND = "canonical_production_verifier"
 TRANSFERRED_PREFIXES = (
     "text_aware_visual_extraction.temperature",
+    "trajectory_encoder.",
+)
+SEMANTICALLY_INCOMPATIBLE_PREFIXES = (
     "vision_poolings.",
     "text_pooling.",
-    "trajectory_encoder.",
 )
 REJECTED_SOURCE_REASONS = {
     "input_projection": "forbidden_single_view_fusion",
@@ -202,6 +204,8 @@ def _reason_for_source(key: str) -> str:
         return REJECTED_SOURCE_REASONS[key]
     if key == "text_aware_visual_extraction.pos_emb":
         return "regenerate_deterministic_visual_position_buffer"
+    if key.startswith(SEMANTICALLY_INCOMPATIBLE_PREFIXES):
+        return "semantic_role_mismatch_pooling_implementation"
     if key.startswith("input_projection"):
         return "forbidden_single_view_fusion"
     if key.startswith("single_step_action_encoder"):
@@ -211,6 +215,14 @@ def _reason_for_source(key: str) -> str:
     if key.startswith(("optimizer", "scheduler", "epoch", "global_step")):
         return "forbidden_bridge_training_state"
     return "not_in_transfer_allowlist"
+
+
+def _fresh_reason(key: str, source_keys: set[str]) -> str:
+    if key.startswith(SEMANTICALLY_INCOMPATIBLE_PREFIXES) and any(
+        source_key.endswith(f"].{key}") for source_key in source_keys
+    ):
+        return "fresh_due_to_semantic_role_mismatch"
+    return "fresh_w3_target" if key not in source_keys else "source_not_accepted"
 
 
 def _lookup_path(mapping: Mapping[str, Any], dotted_key: str) -> Any:
@@ -389,7 +401,7 @@ def audit_bridge_checkpoint(
                     side="target",
                     key=key,
                     state="fresh",
-                    reason="fresh_w3_target" if key not in source_keys else "source_not_accepted",
+                    reason=_fresh_reason(key, source_keys),
                     spec=spec,
                 )
             )
@@ -410,6 +422,7 @@ def audit_bridge_checkpoint(
         "policy": {
             "approved_source_index": APPROVED_SOURCE_INDEX,
             "transferred_prefixes": list(TRANSFERRED_PREFIXES),
+            "fresh_semantic_mismatch_prefixes": list(SEMANTICALLY_INCOMPATIBLE_PREFIXES),
             "weights_only_loader": True,
         },
         "target": {
