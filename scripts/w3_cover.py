@@ -10,7 +10,10 @@ from pathlib import Path
 from lap.verifiers.cover.command import preflight_w3
 from lap.verifiers.cover.command import run_protocol_mode
 from lap.verifiers.cover.pipeline import run_canonical_acceptance
+from lap.verifiers.cover.pipeline import run_evaluate_mode
 from lap.verifiers.cover.pipeline import run_fixture_end_to_end
+from lap.verifiers.cover.pipeline import run_package_mode
+from lap.verifiers.cover.pipeline import run_train_mode
 
 
 def parser() -> argparse.ArgumentParser:
@@ -29,37 +32,37 @@ def parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture", action="store_true")
     parser.add_argument("--per-rank-batch-size", type=int, default=16)
     parser.add_argument("--batch-probe-receipt", type=Path, default=None)
+    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--evidence-root", type=Path, default=None)
     return parser
 
 
-def main() -> None:
-    args = parser().parse_args()
+def dispatch(args: argparse.Namespace) -> dict:
     if args.mode == "fixture-acceptance" or (args.mode in {"train", "evaluate", "package", "accept"} and args.fixture):
-        result = run_fixture_end_to_end(output_root=args.output_root)
-    elif args.mode == "preflight":
-        result = preflight_w3(
+        if args.mode in {"fixture-acceptance", "accept"}:
+            return run_fixture_end_to_end(output_root=args.output_root)
+        raise ValueError("fixture train/evaluate/package modes require their explicit stage inputs")
+    if args.mode == "preflight":
+        return preflight_w3(
             w2_root=args.w2_root,
             bridge_artifact=args.bridge_artifact,
             audit_manifest=args.audit_manifest,
             output_root=args.output_root,
             validator_path=args.validator,
             fixture=args.fixture,
+            protocol_dir=args.protocol_dir,
         )
-    elif args.mode == "protocol":
-        result = run_protocol_mode(
+    if args.mode == "protocol":
+        return run_protocol_mode(
             w2_root=args.w2_root,
             protocol_dir=args.protocol_dir,
             validator_path=args.validator,
             fixture=args.fixture,
             per_rank_batch_size=args.per_rank_batch_size,
-            batch_probe_hash=(
-                None
-                if args.batch_probe_receipt is None
-                else __import__("hashlib").sha256(args.batch_probe_receipt.read_bytes()).hexdigest()
-            ),
+            batch_probe_receipt=args.batch_probe_receipt,
         )
-    else:
-        result = run_canonical_acceptance(
+    if args.mode == "train":
+        return run_train_mode(
             w2_root=args.w2_root,
             bridge_artifact=args.bridge_artifact,
             audit_manifest=args.audit_manifest,
@@ -67,6 +70,29 @@ def main() -> None:
             output_root=args.output_root,
             validator_path=args.validator,
         )
+    if args.mode == "evaluate":
+        if args.checkpoint is None:
+            raise ValueError("evaluate mode requires --checkpoint")
+        return run_evaluate_mode(checkpoint=args.checkpoint, output_root=args.output_root)
+    if args.mode == "package":
+        if args.evidence_root is None:
+            raise ValueError("package mode requires --evidence-root")
+        return run_package_mode(evidence_root=args.evidence_root, output_root=args.output_root)
+    if args.mode == "accept":
+        return run_canonical_acceptance(
+            w2_root=args.w2_root,
+            bridge_artifact=args.bridge_artifact,
+            audit_manifest=args.audit_manifest,
+            protocol_dir=args.protocol_dir,
+            output_root=args.output_root,
+            validator_path=args.validator,
+        )
+
+    raise ValueError(f"unsupported W3 mode: {args.mode}")
+
+
+def main() -> None:
+    result = dispatch(parser().parse_args())
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 

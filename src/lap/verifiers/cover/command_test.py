@@ -45,8 +45,44 @@ def _audit_fixture(tmp_path):
     torch.save({"ensemble_components": [{"text_pooling.weight": torch.ones(2, 2)}, {}, {}]}, artifact)
     unsigned = {
         "schema": "osx_cover_bridge_audit_v1",
-        "artifact": {"sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(), "source_index": 0},
-        "entries": [{"state": "transferred", "target_key": "x", "key": "ensemble_components[0].text_pooling.weight"}],
+        "artifact": {
+            "filename": artifact.name,
+            "size": artifact.stat().st_size,
+            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            "format": "torch_weights_only_ensemble_components_v1",
+            "source_index": 0,
+            "repository": "cover-vla/cover-vla-bridge",
+            "retrieval_method": "test_fixture",
+            "license_provenance": "test_fixture",
+        },
+        "policy": {
+            "approved_source_index": 0,
+            "transferred_prefixes": ["text_pooling."],
+            "weights_only_loader": True,
+        },
+        "target": {
+            "fingerprint": "osx_cover_verifier_production_test",
+            "config": {"test": True},
+            "inventory_kind": "canonical_production_verifier",
+            "key_count": 1,
+            "keys": {"x": {"dtype": "float32", "shape": [2, 2]}},
+            "siglip2_snapshot": {
+                "backbone_id": "hf-hub:timm/ViT-L-16-SigLIP2-384",
+                "revision": "31b4df0bbf802888308ad91850c388b2870ef922",
+                "state": "frozen",
+                "bridge_transfer_excluded": True,
+            },
+        },
+        "entries": [
+            {
+                "side": "source",
+                "state": "transferred",
+                "target_key": "x",
+                "reason": "allowlisted_exact_match",
+                "key": "ensemble_components[0].text_pooling.weight",
+            },
+            {"side": "target", "state": "transferred", "key": "x", "reason": "allowlisted_exact_match"},
+        ],
     }
     unsigned["manifest_sha256"] = hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
     audit = tmp_path / "audit.json"
@@ -80,4 +116,55 @@ def test_audit_manifest_rejects_other_ensemble_member(tmp_path):
     data["manifest_sha256"] = hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
     audit.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     with pytest.raises(ValueError, match="initialize W3"):
+        _audit_manifest(audit, artifact)
+
+
+def test_audit_manifest_rejects_rehashed_wrong_schema(tmp_path):
+    artifact, audit = _audit_fixture(tmp_path)
+    data = json.loads(audit.read_text())
+    data["schema"] = "not_the_audit_schema"
+    unsigned = dict(data)
+    unsigned.pop("manifest_sha256")
+    data["manifest_sha256"] = hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
+    audit.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema"):
+        _audit_manifest(audit, artifact)
+
+
+def test_audit_manifest_rejects_missing_reason_code(tmp_path):
+    artifact, audit = _audit_fixture(tmp_path)
+    data = json.loads(audit.read_text())
+    data["entries"][0].pop("reason")
+    unsigned = dict(data)
+    unsigned.pop("manifest_sha256")
+    data["manifest_sha256"] = hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
+    audit.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"entry|reason"):
+        _audit_manifest(audit, artifact)
+
+
+def test_audit_manifest_rejects_fixture_target_inventory(tmp_path):
+    artifact, audit = _audit_fixture(tmp_path)
+    data = json.loads(audit.read_text())
+    data["target"] = {
+        "fingerprint": "TinyFrozenBackbone:fixture",
+        "config": {"test": True},
+        "inventory_kind": "canonical_production_verifier",
+        "key_count": 1,
+        "keys": {"backbone.image_projection.weight": {"dtype": "float32", "shape": [2, 2]}},
+        "siglip2_snapshot": {
+            "backbone_id": "hf-hub:timm/ViT-L-16-SigLIP2-384",
+            "revision": "31b4df0bbf802888308ad91850c388b2870ef922",
+            "state": "frozen",
+            "bridge_transfer_excluded": True,
+        },
+    }
+    unsigned = dict(data)
+    unsigned.pop("manifest_sha256")
+    data["manifest_sha256"] = hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
+    audit.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"fixture|production|target"):
         _audit_manifest(audit, artifact)

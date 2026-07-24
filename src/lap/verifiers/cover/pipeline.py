@@ -25,12 +25,14 @@ from lap.verifiers.cover.model import TinyFrozenBackbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
 from lap.verifiers.cover.protocol import RunProtocol
+from lap.verifiers.cover.protocol import validate_protocol_directory
 from lap.verifiers.cover.training import create_optimizer
 from lap.verifiers.cover.training import make_base_only_config
 from lap.verifiers.cover.training import require_acceptance_metrics
 from lap.verifiers.cover.training import train_one_batch
 from lap.verifiers.cover.w3_contracts import canonical_bytes
 from lap.verifiers.cover.w3_contracts import content_hash
+from lap.verifiers.cover.w3_contracts import sha256_file
 
 
 def _collate(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -118,28 +120,25 @@ def train_model(
                     validation_losses.append(float(model.contrastive_loss(output)[0]))
             validation_loss = float(np.mean(validation_losses)) if validation_losses else float("inf")
         epoch_record = {
-                "epoch": epoch,
-                "loss": float(np.mean([item["loss"] for item in epoch_metrics])) if epoch_metrics else float("nan"),
-                "validation_loss": validation_loss,
-                "sampler_diagnostics": {
-                    "sampler_rows": len(sample_ids),
-                    "sampler_added_duplicate_rows": max(0, len(sample_ids) - len(set(sample_ids))),
-                    "repeated_instruction_pair_rate": float(1.0 - len(set(instructions)) / len(instructions))
-                    if instructions
-                    else 0.0,
-                    "exact_duplicate_history_pair_rate": float(
-                        sum(np.array_equal(left, right) for left, right in pairwise(histories))
-                        / pair_count
-                    )
-                    if pair_count
-                    else 0.0,
-                    "same_episode_pair_rate": float(
-                        sum(left == right for left, right in pairwise(episodes)) / pair_count
-                    )
-                    if pair_count
-                    else 0.0,
-                },
-            }
+            "epoch": epoch,
+            "loss": float(np.mean([item["loss"] for item in epoch_metrics])) if epoch_metrics else float("nan"),
+            "validation_loss": validation_loss,
+            "sampler_diagnostics": {
+                "sampler_rows": len(sample_ids),
+                "sampler_added_duplicate_rows": max(0, len(sample_ids) - len(set(sample_ids))),
+                "repeated_instruction_pair_rate": float(1.0 - len(set(instructions)) / len(instructions))
+                if instructions
+                else 0.0,
+                "exact_duplicate_history_pair_rate": float(
+                    sum(np.array_equal(left, right) for left, right in pairwise(histories)) / pair_count
+                )
+                if pair_count
+                else 0.0,
+                "same_episode_pair_rate": float(sum(left == right for left, right in pairwise(episodes)) / pair_count)
+                if pair_count
+                else 0.0,
+            },
+        }
         history.append(epoch_record)
         if checkpoint_dir is not None and checkpoint_contract is not None:
             progress = {"epoch": epoch + 1, "global_step": global_step}
@@ -264,7 +263,10 @@ def run_fixture_end_to_end(*, output_root: Path) -> dict[str, Any]:
         ),
         TinyFrozenBackbone(width=32, tokens=8),
     )
-    protocol = RunProtocol(per_rank_batch_size=2, epochs=1, warmup_epochs=1)
+    # The fixture executes one direct diagnostic step, but its serialized
+    # contract must still use the immutable W3 constants rather than inventing
+    # a second protocol variant.
+    protocol = RunProtocol(per_rank_batch_size=16)
     root = output_root.parent / f".{output_root.name}.staging"
     root.mkdir(parents=True)
     try:
@@ -324,6 +326,167 @@ def run_fixture_end_to_end(*, output_root: Path) -> dict[str, Any]:
     return report
 
 
+def run_train_mode(
+    *,
+    w2_root: Path,
+    bridge_artifact: Path,
+    audit_manifest: Path,
+    protocol_dir: Path,
+    output_root: Path,
+    validator_path: Path | None = None,
+    device: torch.device | None = None,
+) -> dict[str, Any]:
+    """Run only the resumable training stage; never evaluate or publish W5."""
+
+    receipt = preflight_w3(
+        w2_root=w2_root,
+        bridge_artifact=bridge_artifact,
+        audit_manifest=audit_manifest,
+        output_root=output_root,
+        validator_path=validator_path,
+        protocol_dir=protocol_dir,
+    )
+    protocol_evidence = validate_protocol_directory(Path(protocol_dir), require_complete=True)
+    protocol_payload = protocol_evidence["protocol"]
+    protocol = RunProtocol(
+        seed=int(protocol_payload["training"]["seed"]),
+        sampler_seed=int(protocol_payload["sampler"]["seed"]),
+        evaluation_seed=int(protocol_payload["evaluation"]["seed"]),
+        per_rank_batch_size=int(protocol_payload["batch"]["per_rank"]),
+        world_size=int(protocol_payload["sampler"]["world_size"]),
+        epochs=int(protocol_payload["optimization"]["epochs"]),
+        learning_rate=float(protocol_payload["optimization"]["learning_rate"]),
+        warmup_epochs=int(protocol_payload["optimization"]["warmup_epochs"]),
+        gradient_clip_norm=float(protocol_payload["optimization"]["gradient_clip_norm"]),
+        bootstrap_replicates=int(protocol_payload["evaluation"]["bootstrap_replicates"]),
+    )
+    dataset = W2DatasetGateway(Path(w2_root), validator_path=validator_path)
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = VerifierModel(VerifierConfig(), OpenClipSigLIP2Backbone(pretrained="hf-hub:timm/ViT-L-16-SigLIP2-384"))
+    audit = json.loads(Path(audit_manifest).read_text(encoding="utf-8"))
+    apply_audited_initialization(model, Path(bridge_artifact), audit)
+    preprocess = getattr(model.backbone, "preprocess", None)
+    dataset_kwargs = {} if preprocess is None else {"preprocess": preprocess}
+    train_dataset = TwoViewDataset(dataset.train, seed=protocol.seed, training=True, **dataset_kwargs)
+    validation_dataset = TwoViewDataset(dataset.validation, training=False, **dataset_kwargs)
+    staging = Path(output_root).parent / f".{Path(output_root).name}.staging"
+    if staging.exists():
+        raise FileExistsError(staging)
+    staging.mkdir(parents=True)
+    try:
+        training = train_model(
+            model,
+            train_dataset,
+            protocol=protocol,
+            device=device,
+            validation_dataset=validation_dataset,
+            checkpoint_dir=staging,
+            checkpoint_contract={
+                "protocol": protocol_payload,
+                "audit_manifest_sha256": audit["manifest_sha256"],
+                "model_config": model.config.to_dict(),
+                "backbone_revision": getattr(model.backbone, "backbone_revision", None),
+                "w2_validation_receipt": dataset.validation_receipt,
+                "views": ["base_rgb", "wrist_rgb"],
+            },
+        )
+        train_receipt = {
+            "schema": "osx_cover_w3_train_receipt_v1",
+            "mode": "train",
+            "preflight": receipt,
+            "protocol": protocol_evidence,
+            "progress": training["progress"],
+            "resumable_checkpoints": ["latest.pt", "best.pt"],
+            "accepted": False,
+        }
+        (staging / "train_receipt.json").write_bytes(canonical_bytes(train_receipt) + b"\n")
+        staging.rename(output_root)
+    except Exception:
+        for path in sorted(staging.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+        staging.rmdir()
+        raise
+    return train_receipt
+
+
+def run_evaluate_mode(*, checkpoint: Path, output_root: Path) -> dict[str, Any]:
+    """Consume one explicitly named fixed checkpoint and stage evaluation input."""
+
+    checkpoint = Path(checkpoint)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    try:
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    except Exception as error:  # pragma: no cover - torch-version-specific errors
+        raise ValueError("evaluation checkpoint is not a safe weights-only payload") from error
+    if not isinstance(payload, dict) or payload.get("schema") != "osx_cover_verifier_checkpoint_v1":
+        raise ValueError("evaluation requires an explicit W3 training checkpoint")
+    output_root = Path(output_root)
+    if output_root.exists():
+        raise FileExistsError(output_root)
+    staging = output_root.parent / f".{output_root.name}.staging"
+    if staging.exists():
+        raise FileExistsError(staging)
+    staging.mkdir(parents=True)
+    try:
+        evaluation_receipt = {
+            "schema": "osx_cover_w3_evaluation_input_v1",
+            "mode": "evaluate",
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": sha256_file(checkpoint),
+            "accepted": False,
+        }
+        (staging / "evaluation_input.json").write_bytes(canonical_bytes(evaluation_receipt) + b"\n")
+        staging.rename(output_root)
+    except Exception:
+        for path in sorted(staging.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+        staging.rmdir()
+        raise
+    return evaluation_receipt
+
+
+def run_package_mode(*, evidence_root: Path, output_root: Path) -> dict[str, Any]:
+    """Stage package input evidence without granting accepted deployment status."""
+
+    evidence_root = Path(evidence_root)
+    evaluation = evidence_root / "evaluation.json"
+    if not evaluation.is_file():
+        raise FileNotFoundError(f"package requires passed evaluation evidence: {evaluation}")
+    output_root = Path(output_root)
+    if output_root.exists():
+        raise FileExistsError(output_root)
+    staging = output_root.parent / f".{output_root.name}.staging"
+    if staging.exists():
+        raise FileExistsError(staging)
+    staging.mkdir(parents=True)
+    try:
+        package_receipt = {
+            "schema": "osx_cover_w3_package_input_v1",
+            "mode": "package",
+            "evidence_root": str(evidence_root),
+            "evaluation_sha256": sha256_file(evaluation),
+            "accepted": False,
+        }
+        (staging / "package_input.json").write_bytes(canonical_bytes(package_receipt) + b"\n")
+        staging.rename(output_root)
+    except Exception:
+        for path in sorted(staging.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+        staging.rmdir()
+        raise
+    return package_receipt
+
+
 def run_canonical_acceptance(
     *,
     w2_root: Path,
@@ -341,6 +504,7 @@ def run_canonical_acceptance(
         audit_manifest=audit_manifest,
         output_root=output_root,
         validator_path=validator_path,
+        protocol_dir=protocol_dir,
     )
     dataset = W2DatasetGateway(Path(w2_root), validator_path=validator_path)
     protocol_payload = json.loads((Path(protocol_dir) / "run_protocol.json").read_text(encoding="utf-8"))
