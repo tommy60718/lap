@@ -99,6 +99,11 @@ def build_probe_receipt(
         "schema": "osx_cover_w3_batch_probe_v2",
         "status": "complete",
         "host": host or platform.node(),
+        "environment": {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "cuda_build": torch.version.cuda,
+        },
         "world_size": WORLD_SIZE,
         "probe_order": list(PROBE_ORDER),
         "attempted_batch_sizes": [attempt["per_rank_batch_size"] for attempt in attempts],
