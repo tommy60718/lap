@@ -430,6 +430,10 @@ def _current_lap_revision() -> str:
     ).strip()
 
 
+def _is_runtime_relevant_path(path: str) -> bool:
+    return path != "AGENTS.md" and not path.startswith(("artifacts/w3/", ".understand-anything/"))
+
+
 def _validate_lap_revision(recorded_revision: str) -> None:
     current_revision = _current_lap_revision()
     if recorded_revision == current_revision:
@@ -447,8 +451,14 @@ def _validate_lap_revision(recorded_revision: str) -> None:
         ).splitlines()
     except (OSError, subprocess.CalledProcessError) as error:
         raise ValueError("batch receipt LAP revision is not an ancestor of the current checkout") from error
-    if any(not path.startswith("artifacts/w3/") for path in changed):
+    if any(_is_runtime_relevant_path(path) for path in changed):
         raise ValueError("batch receipt LAP revision has relevant code or environment drift")
+    dirty_paths = subprocess.check_output(
+        ["git", "-C", str(_project_root()), "status", "--porcelain", "--untracked-files=all"],
+        text=True,
+    ).splitlines()
+    if any(_is_runtime_relevant_path(line[3:]) for line in dirty_paths):
+        raise ValueError("current LAP checkout has uncommitted runtime-relevant changes")
 
 
 def _validate_environment(environment: Mapping[str, Any]) -> None:

@@ -14,6 +14,7 @@ from lap.verifiers.cover.protocol import EVALUATION_SEED
 from lap.verifiers.cover.protocol import PROBE_ORDER
 from lap.verifiers.cover.protocol import TRAINING_SEED
 from lap.verifiers.cover.protocol import WORLD_SIZE
+from lap.verifiers.cover.protocol import _is_runtime_relevant_path
 from lap.verifiers.cover.protocol import build_bootstrap_indices
 from lap.verifiers.cover.protocol import build_phrase_manifest
 from lap.verifiers.cover.protocol import build_shuffled_pairs
@@ -65,6 +66,14 @@ def _canonical_gpu_snapshots():
             "free_memory_mib": 47100,
         },
     ]
+
+
+def test_revision_drift_classification_ignores_only_non_runtime_w3_paths():
+    assert not _is_runtime_relevant_path("AGENTS.md")
+    assert not _is_runtime_relevant_path("artifacts/w3/protocol/run_protocol.json")
+    assert not _is_runtime_relevant_path(".understand-anything/graph.json")
+    assert _is_runtime_relevant_path("src/lap/verifiers/cover/model.py")
+    assert _is_runtime_relevant_path("uv.lock")
 
 
 def test_phrase_manifest_has_exact_approved_bank():
