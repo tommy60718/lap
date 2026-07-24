@@ -13,6 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 import platform
+import subprocess
 from typing import Any
 import unicodedata
 
@@ -335,15 +336,33 @@ def snapshot_nvidia_devices() -> list[dict[str, Any]]:
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < WORLD_SIZE:
         raise RuntimeError("W3 batch probe requires two visible NVIDIA GPUs")
+    try:
+        physical_rows = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        ).splitlines()
+        physical_memory = {
+            int(row.split(",", 1)[0].strip()): float(row.split(",", 1)[1].strip())
+            for row in physical_rows
+            if row.strip()
+        }
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+        raise RuntimeError("W3 batch probe could not remeasure physical GPU memory with nvidia-smi") from error
     snapshots = []
     for index in range(WORLD_SIZE):
         free_bytes, allocatable_bytes = torch.cuda.mem_get_info(index)
         properties = torch.cuda.get_device_properties(index)
+        if index not in physical_memory:
+            raise RuntimeError(f"nvidia-smi did not report physical memory for GPU {index}")
         snapshots.append(
             {
                 "index": index,
                 "name": properties.name,
-                "physical_total_memory_mib": properties.total_memory / (1024**2),
+                "physical_total_memory_mib": physical_memory[index],
                 "allocatable_total_memory_mib": allocatable_bytes / (1024**2),
                 "free_memory_mib": free_bytes / (1024**2),
             }

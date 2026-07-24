@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 import hashlib
 import math
@@ -179,9 +180,19 @@ class VerifierModel(nn.Module):
         if self.config.use_wrist and wrist_rgb is None:
             raise ValueError("two-view verifier requires wrist_rgb")
         with torch.no_grad():
-            base_tokens = self.backbone.encode_image_tokens(base_rgb)
-            wrist_tokens = self.backbone.encode_image_tokens(wrist_rgb) if wrist_rgb is not None else None
-            text_tokens = self.backbone.encode_text_tokens(instructions)
+            autocast_context = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if base_rgb.device.type == "cuda"
+                else nullcontext()
+            )
+            with autocast_context:
+                base_tokens = self.backbone.encode_image_tokens(base_rgb)
+                wrist_tokens = self.backbone.encode_image_tokens(wrist_rgb) if wrist_rgb is not None else None
+                text_tokens = self.backbone.encode_text_tokens(instructions)
+            base_tokens = base_tokens.float()
+            if wrist_tokens is not None:
+                wrist_tokens = wrist_tokens.float()
+            text_tokens = text_tokens.float()
         base_tokens = self.text_aware_visual_extraction(base_tokens)
         base_feature = self.vision_poolings(base_tokens.transpose(0, 1))
         features = [base_feature]
@@ -281,13 +292,13 @@ class TinyFrozenBackbone(nn.Module):
 class OpenClipSigLIP2Backbone(nn.Module):
     """Lazy OpenCLIP adapter; tests inject TinyFrozenBackbone instead."""
 
-    def __init__(self, *, pretrained: str | None = None) -> None:
+    def __init__(self, *, model_name: str = BACKBONE_ID, pretrained: str | None = None) -> None:
         super().__init__()
         try:
             import open_clip  # noqa: PLC0415
         except ImportError as error:  # pragma: no cover - environment-specific
             raise RuntimeError("W3 requires open_clip_torch in the LAP environment") from error
-        model, _, preprocess = open_clip.create_model_and_transforms(BACKBONE_ID, pretrained=pretrained)
+        model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
         self.model = model.eval()
         self.preprocess = preprocess
         self.backbone_revision = BACKBONE_REVISION
@@ -297,6 +308,7 @@ class OpenClipSigLIP2Backbone(nn.Module):
 
     def encode_image_tokens(self, images: torch.Tensor) -> torch.Tensor:
         visual = self.model.visual
+        images = images.to(dtype=next(self.model.parameters()).dtype)
         tokens = visual.forward_features(images) if hasattr(visual, "forward_features") else visual(images)
         if tokens.ndim == 2:
             tokens = tokens.unsqueeze(1)
