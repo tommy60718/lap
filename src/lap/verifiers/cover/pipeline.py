@@ -1,0 +1,489 @@
+"""End-to-end W3 composition used by the public script and acceptance tests."""
+
+from __future__ import annotations
+
+from itertools import pairwise
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from lap.verifiers.cover.bridge_audit import apply_audited_initialization
+from lap.verifiers.cover.checkpoint import publish_deployment_bundle
+from lap.verifiers.cover.checkpoint import save_training_checkpoint
+from lap.verifiers.cover.command import preflight_w3
+from lap.verifiers.cover.data import TwoViewDataset
+from lap.verifiers.cover.data import W2DatasetGateway
+from lap.verifiers.cover.data import make_sampler
+from lap.verifiers.cover.evaluator import compare_ablation
+from lap.verifiers.cover.evaluator import evaluate_embeddings
+from lap.verifiers.cover.model import OpenClipSigLIP2Backbone
+from lap.verifiers.cover.model import TinyFrozenBackbone
+from lap.verifiers.cover.model import VerifierConfig
+from lap.verifiers.cover.model import VerifierModel
+from lap.verifiers.cover.protocol import RunProtocol
+from lap.verifiers.cover.training import create_optimizer
+from lap.verifiers.cover.training import make_base_only_config
+from lap.verifiers.cover.training import require_acceptance_metrics
+from lap.verifiers.cover.training import train_one_batch
+from lap.verifiers.cover.w3_contracts import canonical_bytes
+from lap.verifiers.cover.w3_contracts import content_hash
+
+
+def _collate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "sample_ids": [row["sample_id"] for row in rows],
+        "episode_ids": [row["episode_id"] for row in rows],
+        "base_rgb": torch.stack([row["base_rgb"] for row in rows]),
+        "wrist_rgb": torch.stack([row["wrist_rgb"] for row in rows]),
+        "instructions": [row["instruction"] for row in rows],
+        "action_histories": torch.stack([row["action_history"] for row in rows]),
+        "conditions": [row["condition"] for row in rows],
+    }
+
+
+def train_model(
+    model: VerifierModel,
+    dataset: TwoViewDataset,
+    *,
+    protocol: RunProtocol,
+    device: torch.device,
+    epochs: int | None = None,
+    validation_dataset: TwoViewDataset | None = None,
+    checkpoint_dir: Path | None = None,
+    checkpoint_contract: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    model.to(device)
+    optimizer, scheduler = create_optimizer(model, protocol)
+    sampler = make_sampler(dataset, seed=protocol.sampler_seed, world_size=protocol.world_size)
+    loader = DataLoader(dataset, batch_size=protocol.per_rank_batch_size, sampler=sampler, collate_fn=_collate)
+    history = []
+    best_validation_loss = float("inf")
+    global_step = 0
+    if checkpoint_dir is not None:
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    for epoch in range(epochs if epochs is not None else protocol.epochs):
+        dataset.set_epoch(epoch)
+        sampler.set_epoch(epoch)
+        epoch_metrics = []
+        epoch_rows: list[dict[str, Any]] = []
+        for raw_batch in loader:
+            epoch_rows.extend(
+                {
+                    "sample_id": sample_id,
+                    "episode_id": episode_id,
+                    "instruction": instruction,
+                    "history": action_history.detach().cpu().numpy(),
+                }
+                for sample_id, episode_id, instruction, action_history in zip(
+                    raw_batch["sample_ids"],
+                    raw_batch["episode_ids"],
+                    raw_batch["instructions"],
+                    raw_batch["action_histories"],
+                    strict=True,
+                )
+            )
+            device_batch = {
+                key: value.to(device) if torch.is_tensor(value) else value for key, value in raw_batch.items()
+            }
+            epoch_metrics.append(train_one_batch(model, device_batch, optimizer))
+            global_step += 1
+        scheduler.step()
+        instructions = [row["instruction"] for row in epoch_rows]
+        sample_ids = [row["sample_id"] for row in epoch_rows]
+        episodes = [row["episode_id"] for row in epoch_rows]
+        histories = [row["history"] for row in epoch_rows]
+        pair_count = max(0, len(epoch_rows) - 1)
+        validation_loss = None
+        if validation_dataset is not None:
+            model.eval()
+            validation_loader = DataLoader(
+                validation_dataset,
+                batch_size=protocol.per_rank_batch_size,
+                shuffle=False,
+                collate_fn=_collate,
+            )
+            validation_losses = []
+            with torch.no_grad():
+                for validation_batch in validation_loader:
+                    output = model(
+                        validation_batch["base_rgb"].to(device),
+                        validation_batch["wrist_rgb"].to(device),
+                        validation_batch["instructions"],
+                        validation_batch["action_histories"].to(device),
+                    )
+                    validation_losses.append(float(model.contrastive_loss(output)[0]))
+            validation_loss = float(np.mean(validation_losses)) if validation_losses else float("inf")
+        epoch_record = {
+                "epoch": epoch,
+                "loss": float(np.mean([item["loss"] for item in epoch_metrics])) if epoch_metrics else float("nan"),
+                "validation_loss": validation_loss,
+                "sampler_diagnostics": {
+                    "sampler_rows": len(sample_ids),
+                    "sampler_added_duplicate_rows": max(0, len(sample_ids) - len(set(sample_ids))),
+                    "repeated_instruction_pair_rate": float(1.0 - len(set(instructions)) / len(instructions))
+                    if instructions
+                    else 0.0,
+                    "exact_duplicate_history_pair_rate": float(
+                        sum(np.array_equal(left, right) for left, right in pairwise(histories))
+                        / pair_count
+                    )
+                    if pair_count
+                    else 0.0,
+                    "same_episode_pair_rate": float(
+                        sum(left == right for left, right in pairwise(episodes)) / pair_count
+                    )
+                    if pair_count
+                    else 0.0,
+                },
+            }
+        history.append(epoch_record)
+        if checkpoint_dir is not None and checkpoint_contract is not None:
+            progress = {"epoch": epoch + 1, "global_step": global_step}
+            sampler_state = {"epoch": epoch}
+            save_training_checkpoint(
+                Path(checkpoint_dir) / "latest.pt",
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                progress=progress,
+                contract=checkpoint_contract,
+                sampler_state=sampler_state,
+            )
+            selection_loss = validation_loss if validation_loss is not None else epoch_record["loss"]
+            if selection_loss < best_validation_loss:
+                best_validation_loss = selection_loss
+                save_training_checkpoint(
+                    Path(checkpoint_dir) / "best.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    progress=progress,
+                    contract=checkpoint_contract,
+                    sampler_state=sampler_state,
+                )
+    return {
+        "history": history,
+        "progress": {"epoch": len(history), "global_step": global_step},
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+    }
+
+
+def collect_embeddings(
+    model: VerifierModel, dataset: TwoViewDataset, *, device: torch.device, batch_size: int
+) -> dict[str, Any]:
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=_collate)
+    semantic = []
+    action = []
+    sample_ids = []
+    episodes = []
+    conditions = []
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            output = model(
+                batch["base_rgb"].to(device),
+                batch["wrist_rgb"].to(device),
+                batch["instructions"],
+                batch["action_histories"].to(device),
+            )
+            semantic.append(output["semantic_embedding"].cpu().numpy())
+            action.append(output["action_embedding"].cpu().numpy())
+            sample_ids.extend(batch["sample_ids"])
+            episodes.extend(batch["episode_ids"])
+            conditions.extend(batch["conditions"])
+    return {
+        "semantic": np.concatenate(semantic),
+        "action": np.concatenate(action),
+        "sample_ids": sample_ids,
+        "episode_ids": episodes,
+        "conditions": conditions,
+    }
+
+
+def run_matched_base_only(
+    *,
+    two_view_model: VerifierModel,
+    bridge_artifact: Path,
+    audit_manifest: dict[str, Any],
+    dataset: W2DatasetGateway,
+    protocol: RunProtocol,
+    shuffled_pairs: list[dict[str, str]],
+    nearby_pairs: list[dict[str, str]],
+    bootstrap_indices: np.ndarray,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Train/evaluate the nondeployable wrist-omitting control on shared artifacts."""
+    base_model = VerifierModel(make_base_only_config(two_view_model.config), two_view_model.backbone)
+    apply_audited_initialization(base_model, Path(bridge_artifact), audit_manifest)
+    preprocess = getattr(two_view_model.backbone, "preprocess", None)
+    dataset_kwargs = {} if preprocess is None else {"preprocess": preprocess}
+    train_dataset = TwoViewDataset(dataset.train, seed=protocol.seed, training=True, **dataset_kwargs)
+    training = train_model(base_model, train_dataset, protocol=protocol, device=device)
+    validation_dataset = TwoViewDataset(dataset.validation, training=False, **dataset_kwargs)
+    embeddings = collect_embeddings(
+        base_model, validation_dataset, device=device, batch_size=protocol.per_rank_batch_size
+    )
+    report = evaluate_embeddings(
+        embeddings["semantic"],
+        embeddings["action"],
+        sample_ids=embeddings["sample_ids"],
+        episode_ids=embeddings["episode_ids"],
+        conditions=embeddings["conditions"],
+        shuffled_pairs=shuffled_pairs,
+        nearby_pairs=nearby_pairs,
+        bootstrap_indices=bootstrap_indices,
+        checkpoint_logit_scale=float(base_model.logit_scale.detach().clamp(0.0, np.log(100.0)).exp()),
+        strict_protocol=True,
+    )
+    report["variant"] = "base_only"
+    report["deployable"] = False
+    report["training"] = training["history"]
+    report["content_hash"] = content_hash({key: value for key, value in report.items() if key != "content_hash"})
+    return {"model": base_model, "training": training, "report": report}
+
+
+def run_fixture_end_to_end(*, output_root: Path) -> dict[str, Any]:
+    """Produce a tiny deterministic package used by command-level acceptance tests."""
+    output_root = Path(output_root)
+    if output_root.exists():
+        raise FileExistsError(output_root)
+    model = VerifierModel(
+        VerifierConfig(
+            backbone_width=32,
+            embedding_width=16,
+            visual_tokens=8,
+            num_heads=4,
+            pooling_layers=1,
+            trajectory_layers=1,
+            feed_forward_width=32,
+        ),
+        TinyFrozenBackbone(width=32, tokens=8),
+    )
+    protocol = RunProtocol(per_rank_batch_size=2, epochs=1, warmup_epochs=1)
+    root = output_root.parent / f".{output_root.name}.staging"
+    root.mkdir(parents=True)
+    try:
+        optimizer, scheduler = create_optimizer(model, protocol)
+        images = torch.zeros(2, 3, 384, 384)
+        histories = torch.zeros(2, 10, 7)
+        metrics = train_one_batch(
+            model,
+            {
+                "base_rgb": images,
+                "wrist_rgb": images,
+                "instructions": ["insert peg", "insert peg"],
+                "action_histories": histories,
+            },
+            optimizer,
+        )
+        save_training_checkpoint(
+            root / "latest.pt",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            progress={"epoch": 1},
+            contract={"protocol": protocol.to_dict(train_manifest_hash="fixture", phrase_manifest_hash="fixture")},
+            sampler_state={"epoch": 0},
+        )
+        metadata = {
+            "deployable": True,
+            "model_config": model.config.to_dict(),
+            "scorer_compatibility": {
+                "model_schema_version": "osx_cover_verifier_checkpoint_v1",
+                "views": ["base_rgb", "wrist_rgb"],
+                "preprocessing_contract": "fixture_384_center_crop_v1",
+                "action_dimension": 7,
+                "action_order": ["dx", "dy", "dz", "rotation_x", "rotation_y", "rotation_z", "gripper"],
+                "history_length": 10,
+                "representation_id": "ur5e_cover_relative_eef_v1",
+                "normalization_artifact_hash": "fixture",
+                "input_dtype": "float32",
+                "output_shape_rank": 1,
+            },
+        }
+        deployment_root = root / "deployment"
+        publish_deployment_bundle(deployment_root, model=model, metadata=metadata, accepted_marker=False)
+        report = {"schema": "osx_cover_w3_fixture_acceptance_v1", "training": metrics, "deployment": "deployment"}
+        (root / "acceptance.json").write_bytes(
+            canonical_bytes({**report, "content_hash": content_hash(report)}) + b"\n"
+        )
+        root.rename(output_root)
+    except Exception:
+        for path in sorted(root.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+        root.rmdir()
+        raise
+    return report
+
+
+def run_canonical_acceptance(
+    *,
+    w2_root: Path,
+    bridge_artifact: Path,
+    audit_manifest: Path,
+    protocol_dir: Path,
+    output_root: Path,
+    validator_path: Path | None = None,
+    device: torch.device | None = None,
+) -> dict[str, Any]:
+    """Run the complete canonical path; publication occurs only after acceptance."""
+    receipt = preflight_w3(
+        w2_root=w2_root,
+        bridge_artifact=bridge_artifact,
+        audit_manifest=audit_manifest,
+        output_root=output_root,
+        validator_path=validator_path,
+    )
+    dataset = W2DatasetGateway(Path(w2_root), validator_path=validator_path)
+    protocol_payload = json.loads((Path(protocol_dir) / "run_protocol.json").read_text(encoding="utf-8"))
+    protocol = RunProtocol(
+        seed=int(protocol_payload["seed"]),
+        sampler_seed=int(protocol_payload["sampler"]["seed"]),
+        per_rank_batch_size=int(protocol_payload["batch"]["per_rank"]),
+        world_size=int(protocol_payload["sampler"]["world_size"]),
+        epochs=int(protocol_payload["optimization"]["epochs"]),
+        learning_rate=float(protocol_payload["optimization"]["learning_rate"]),
+        warmup_epochs=int(protocol_payload["optimization"]["warmup_epochs"]),
+        gradient_clip_norm=float(protocol_payload["optimization"]["gradient_clip_norm"]),
+        bootstrap_replicates=int(protocol_payload["evaluation"]["bootstrap_replicates"]),
+    )
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = VerifierModel(VerifierConfig(), OpenClipSigLIP2Backbone(pretrained="hf-hub:timm/ViT-L-16-SigLIP2-384"))
+    audit = json.loads(Path(audit_manifest).read_text(encoding="utf-8"))
+    apply_audited_initialization(model, Path(bridge_artifact), audit)
+    train_preprocess = getattr(model.backbone, "preprocess", None)
+    dataset_kwargs = {} if train_preprocess is None else {"preprocess": train_preprocess}
+    train_dataset = TwoViewDataset(dataset.train, seed=protocol.seed, training=True, **dataset_kwargs)
+    staging = Path(output_root).parent / f".{Path(output_root).name}.staging"
+    if staging.exists():
+        raise FileExistsError(staging)
+    staging.mkdir(parents=True)
+    validation_dataset = TwoViewDataset(dataset.validation, training=False, **dataset_kwargs)
+    checkpoint_contract = {
+        "protocol": protocol_payload,
+        "audit_manifest_sha256": audit["manifest_sha256"],
+        "model_config": model.config.to_dict(),
+        "backbone_revision": getattr(model.backbone, "backbone_revision", None),
+        "preprocessing_contract": "openclip_model_eval_transform_v1",
+        "w2_validation_receipt": dataset.validation_receipt,
+        "views": ["base_rgb", "wrist_rgb"],
+    }
+    training = train_model(
+        model,
+        train_dataset,
+        protocol=protocol,
+        device=device,
+        validation_dataset=validation_dataset,
+        checkpoint_dir=staging,
+        checkpoint_contract=checkpoint_contract,
+    )
+    try:
+        embeddings = collect_embeddings(
+            model, validation_dataset, device=device, batch_size=protocol.per_rank_batch_size
+        )
+        shuffled = json.loads((Path(protocol_dir) / "shuffled_pairs.json").read_text(encoding="utf-8"))["pairs"]
+        nearby = json.loads((Path(protocol_dir) / "nearby_pairs.json").read_text(encoding="utf-8"))["pairs"]
+        bootstrap = np.load(Path(protocol_dir) / "bootstrap_indices.npy")
+        report = evaluate_embeddings(
+            embeddings["semantic"],
+            embeddings["action"],
+            sample_ids=embeddings["sample_ids"],
+            episode_ids=embeddings["episode_ids"],
+            conditions=embeddings["conditions"],
+            shuffled_pairs=shuffled,
+            nearby_pairs=nearby,
+            bootstrap_indices=bootstrap,
+            checkpoint_logit_scale=float(model.logit_scale.detach().clamp(0.0, np.log(100.0)).exp()),
+            strict_protocol=True,
+        )
+        require_acceptance_metrics(report)
+        base_only = run_matched_base_only(
+            two_view_model=model,
+            bridge_artifact=Path(bridge_artifact),
+            audit_manifest=audit,
+            dataset=dataset,
+            protocol=protocol,
+            shuffled_pairs=shuffled,
+            nearby_pairs=nearby,
+            bootstrap_indices=bootstrap,
+            device=device,
+        )
+        ablation = compare_ablation(report, base_only["report"], bootstrap_indices=bootstrap)
+        (staging / "base_only").mkdir()
+        save_training_checkpoint(
+            staging / "base_only" / "latest.pt",
+            model=base_only["model"],
+            optimizer=base_only["training"]["optimizer"],
+            scheduler=base_only["training"]["scheduler"],
+            progress=base_only["training"]["progress"],
+            contract={
+                "variant": "base_only",
+                "deployable": False,
+                "protocol": protocol_payload,
+                "audit_manifest_sha256": audit["manifest_sha256"],
+            },
+            sampler_state={"epoch": base_only["training"]["progress"]["epoch"]},
+        )
+        (staging / "base_only" / "metadata.json").write_bytes(
+            canonical_bytes(
+                {
+                    "schema": "osx_cover_w3_base_only_evidence_v1",
+                    "deployable": False,
+                    "model_config": base_only["model"].config.to_dict(),
+                    "evaluation_report": base_only["report"],
+                    "ablation_report": ablation,
+                }
+            )
+            + b"\n"
+        )
+        metadata = {
+            "deployable": True,
+            "model_config": model.config.to_dict(),
+            "backbone_revision": getattr(model.backbone, "backbone_revision", None),
+            "preprocessing_contract": "openclip_model_eval_transform_v1",
+            "tokenizer_id": "open_clip.get_tokenizer(hf-hub:timm/ViT-L-16-SigLIP2-384)",
+            "evaluation_report": report,
+            "base_only_ablation": ablation,
+            "audit_manifest_sha256": audit["manifest_sha256"],
+            "scorer_compatibility": {
+                "model_schema_version": "osx_cover_verifier_checkpoint_v1",
+                "views": ["base_rgb", "wrist_rgb"],
+                "preprocessing_contract": "openclip_siglip2_384_center_crop_v1",
+                "action_dimension": 7,
+                "action_order": ["dx", "dy", "dz", "rotation_x", "rotation_y", "rotation_z", "gripper"],
+                "history_length": 10,
+                "representation_id": "ur5e_cover_relative_eef_v1",
+                "normalization_artifact_hash": dataset.validation_receipt["normalization_artifact_hash"],
+                "input_dtype": "float32",
+                "output_shape_rank": 1,
+            },
+        }
+        publish_deployment_bundle(staging / "deployment", model=model, metadata=metadata)
+        final_report = {
+            "schema": "osx_cover_w3_acceptance_v1",
+            "preflight": receipt,
+            "training": training["history"],
+            "evaluation": report,
+            "deployment": "deployment",
+            "authority": "recorded_data_offline_integration_only",
+        }
+        final_report["content_hash"] = content_hash(final_report)
+        (staging / "acceptance.json").write_bytes(canonical_bytes(final_report) + b"\n")
+        staging.rename(output_root)
+    except Exception:
+        for path in sorted(staging.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+        staging.rmdir()
+        raise
+    return final_report
