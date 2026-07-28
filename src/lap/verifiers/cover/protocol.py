@@ -38,6 +38,7 @@ SHUFFLED_COUNT = 1112
 VALIDATION_COUNT = 1118
 BOOTSTRAP_REPLICATES = 10000
 NEARBY_OFFSET = 15
+ACCEPTED_VALIDATION_SEMANTICS_HASH = "4d7d9ad47ab47f5c8ada380e8b9e7ceef6a22bc32d2c519d901b0e7b909f8e4f"
 
 APPROVED_SHUFFLED_EXCLUSIONS = (
     "circular_posy_demo_07:000110",
@@ -782,6 +783,8 @@ def validate_protocol_directory(
     validation_semantics_hash = identities.get("validation_semantics_hash")
     if not isinstance(validation_semantics_hash, str) or len(validation_semantics_hash) != 64:
         raise ValueError("protocol validation-semantics identity is invalid")
+    if validation_semantics_hash != ACCEPTED_VALIDATION_SEMANTICS_HASH:
+        raise ValueError("protocol validation-semantics identity drifted from the immutable W2 input")
     if validation is not None and validation_semantics_hash != content_hash(_validation_semantics(validation)):
         raise ValueError("protocol validation-semantics identity drifted from the immutable W2 input")
     has_capacity_evidence = "batch_probe_receipt" in artifacts

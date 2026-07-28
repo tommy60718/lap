@@ -359,6 +359,19 @@ def test_protocol_core_binds_the_immutable_w2_validation_semantics(tmp_path):
     )
 
 
+def test_protocol_core_rejects_coherently_rehashed_noncanonical_w2_order(tmp_path):
+    validation = _canonical_validation_rows()
+    validation[0], validation[1] = validation[1], validation[0]
+    materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=validation,
+    )
+
+    with pytest.raises(ValueError, match="immutable W2"):
+        validate_protocol_directory(tmp_path, require_complete=False)
+
+
 def test_protocol_core_repeated_materialization_is_byte_identical(tmp_path):
     validation = _canonical_validation_rows()
     first = tmp_path / "first"
