@@ -1,17 +1,21 @@
-"""Canonical two-rank NVIDIA batch-size preflight for W3-03."""
+"""Canonical two-rank NVIDIA optimizer-step and capacity evidence for W3-05."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
+import random
 import subprocess
 import sys
 import tempfile
 from typing import Any
 
+import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel
 
@@ -24,7 +28,9 @@ from lap.verifiers.cover.model import OpenClipSigLIP2Backbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
 from lap.verifiers.cover.protocol import PROBE_ORDER
+from lap.verifiers.cover.protocol import RunProtocol
 from lap.verifiers.cover.protocol import snapshot_nvidia_devices
+from lap.verifiers.cover.training import create_optimizer
 from lap.verifiers.cover.w3_contracts import BACKBONE_ID
 from lap.verifiers.cover.w3_contracts import BACKBONE_REVISION
 from lap.verifiers.cover.w3_contracts import content_hash
@@ -39,6 +45,39 @@ _BASELINE = {
     "allocatable_total_memory_mib": [48502.69, 48510.94],
     "free_memory_mib": [47882.56, 48061.75],
 }
+
+
+def validate_successful_rank_records(ranks: Sequence[Mapping[str, Any]], *, batch_size: int) -> None:
+    """Require exact two-rank evidence for a synchronized finite optimizer step."""
+
+    records = [dict(rank) for rank in ranks]
+    if sorted(record.get("rank") for record in records) != [0, 1]:
+        raise ValueError("successful W3 probe must contain exactly ranks 0 and 1")
+    for record in records:
+        finite_scalars = (record.get("loss"), record.get("gradient_norm"))
+        if (
+            record.get("status") != "passed"
+            or record.get("forward") != "passed"
+            or record.get("backward") != "passed"
+            or record.get("optimizer_step") != "passed"
+            or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in finite_scalars)
+            or record.get("gradients_finite") is not True
+            or record.get("parameters_finite") is not True
+            or record.get("trainable_state_changed") is not True
+            or record.get("frozen_state_unchanged") is not True
+            or record.get("local_negative_pool_size") != batch_size
+            or record.get("embedding_all_gather") is not False
+            or record.get("frozen_backbone_dtype") != "bfloat16"
+            or record.get("trainable_dtype") != "float32"
+            or record.get("logits_dtype") != "float32"
+        ):
+            raise ValueError("each successful rank must record a full finite optimizer step")
+    fingerprints = [record.get("gradient_fingerprint") for record in records]
+    if (
+        any(not isinstance(fingerprint, str) or len(fingerprint) != 64 for fingerprint in fingerprints)
+        or len(set(fingerprints)) != 1
+    ):
+        raise ValueError("successful DDP ranks must record one synchronized gradient fingerprint")
 
 
 def compare_memory_to_baseline(snapshot: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -84,6 +123,53 @@ def compare_memory_to_baseline(snapshot: Sequence[Mapping[str, Any]]) -> dict[st
     }
 
 
+def probe_batch_sizes(
+    step_fn: Callable[[int, int, Mapping[str, Any]], Mapping[str, Any] | None],
+    *,
+    snapshot_fn: Callable[[], Sequence[Mapping[str, Any]]] = snapshot_nvidia_devices,
+    model_identity: Mapping[str, Any] | None = None,
+    candidates: Sequence[int] = PROBE_ORDER,
+) -> dict[str, Any]:
+    """Run an injectable two-rank optimizer-step probe through the canonical owner."""
+
+    if tuple(candidates) != PROBE_ORDER:
+        raise ValueError("W3 batch probe order is fixed at 64, 32, 16")
+    snapshot = [dict(gpu) for gpu in snapshot_fn()]
+    memory_drift = compare_memory_to_baseline(snapshot)
+    attempts = []
+    for batch_size in PROBE_ORDER:
+        rank_results = []
+        try:
+            for rank, gpu in enumerate(snapshot):
+                result = dict(step_fn(batch_size, rank, gpu) or {})
+                if result.get("status") == "failed":
+                    raise RuntimeError(str(result.get("error", "probe step failed")))
+                rank_results.append(result)
+            validate_successful_rank_records(rank_results, batch_size=batch_size)
+        except BaseException as error:
+            if not _is_oom(error):
+                raise
+            attempts.append(
+                {
+                    "per_rank_batch_size": batch_size,
+                    "status": "failed",
+                    "failure": "out_of_memory",
+                    "error_type": type(error).__name__,
+                    "ranks_completed": len(rank_results),
+                }
+            )
+            continue
+        attempts.append({"per_rank_batch_size": batch_size, "status": "passed", "ranks": rank_results})
+        return build_probe_receipt(
+            snapshot=snapshot,
+            attempts=attempts,
+            selected_batch_size=batch_size,
+            memory_drift=memory_drift,
+            evidence=model_identity,
+        )
+    raise RuntimeError("no W3 batch size fit the approved two-rank probe order")
+
+
 def build_probe_receipt(
     *,
     snapshot: Sequence[Mapping[str, Any]],
@@ -97,6 +183,14 @@ def build_probe_receipt(
 
     if selected_batch_size not in PROBE_ORDER:
         raise ValueError("selected batch size is outside the approved W3 probe order")
+    successful = [
+        attempt
+        for attempt in attempts
+        if attempt.get("status") == "passed" and attempt.get("per_rank_batch_size") == selected_batch_size
+    ]
+    if len(successful) != 1:
+        raise ValueError("successful W3 probe must contain exactly ranks 0 and 1")
+    validate_successful_rank_records(successful[0].get("ranks", []), batch_size=selected_batch_size)
     selected_evidence = dict(evidence or {})
     environment = {
         "python_executable": selected_evidence.get("python_executable", sys.executable),
@@ -112,17 +206,22 @@ def build_probe_receipt(
         ),
     }
     model_provenance = {
-        "canonical_target": True,
-        "backbone": BACKBONE_ID,
-        "backbone_revision": BACKBONE_REVISION,
+        "canonical_target": selected_evidence.get("canonical_target", True),
+        "backbone": selected_evidence.get("backbone", BACKBONE_ID),
+        "backbone_revision": selected_evidence.get("backbone_revision", BACKBONE_REVISION),
         "configuration": selected_evidence.get("configuration", VerifierConfig().to_dict()),
         "configuration_hash": selected_evidence.get("configuration_hash", content_hash(VerifierConfig().to_dict())),
         "audit_manifest_sha256": selected_evidence.get("audit_manifest_sha256", "0" * 64),
         "target_inventory_fingerprint": selected_evidence.get("target_inventory_fingerprint", "0" * 64),
+        "preprocessing_fingerprint": selected_evidence.get("preprocessing_fingerprint", "0" * 64),
+        "tokenizer_fingerprint": selected_evidence.get("tokenizer_fingerprint", "0" * 64),
         "two_view": True,
+        "negative_pool": "rank_local",
+        "gradient_synchronization": "two_rank_ddp",
         "trainable_dtype": "float32",
         "frozen_backbone_dtype": "bfloat16",
-        "automatic_mixed_precision": False,
+        "logits_dtype": "float32",
+        "frozen_encoder_autocast": "cuda_bfloat16",
     }
     payload = {
         "schema": "osx_cover_w3_batch_probe_v2",
@@ -133,12 +232,12 @@ def build_probe_receipt(
         "probe_order": list(PROBE_ORDER),
         "attempted_batch_sizes": [attempt["per_rank_batch_size"] for attempt in attempts],
         "selected_per_rank_batch_size": selected_batch_size,
-        "selection_rule": "first_successful_two_rank_forward_backward",
+        "selection_rule": "first_successful_two_rank_optimizer_step",
         "gpu_snapshot": [dict(gpu) for gpu in snapshot],
         "memory_drift": dict(memory_drift),
         "model": model_provenance,
         "attempts": [dict(attempt) for attempt in attempts],
-        "successful_two_rank_forward_backward": {"batch_size": selected_batch_size, "ranks": [0, 1]},
+        "successful_two_rank_optimizer_step": {"batch_size": selected_batch_size, "ranks": [0, 1]},
     }
     payload["content_hash"] = content_hash(payload)
     return payload
@@ -186,6 +285,43 @@ def _is_oom(error: BaseException | str) -> bool:
     return isinstance(error, MemoryError) or "out of memory" in text or "cuda error: out of memory" in text
 
 
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _tensor_fingerprint(named_tensors: Sequence[tuple[str, torch.Tensor]]) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in named_tensors:
+        digest.update(name.encode("utf-8"))
+        value = tensor.detach().contiguous().cpu()
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _parameter_fingerprint(model: torch.nn.Module, *, trainable: bool) -> str:
+    return _tensor_fingerprint(
+        [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad is trainable]
+    )
+
+
+def _gradient_fingerprint(model: torch.nn.Module) -> str:
+    gradients = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.grad is None:
+            raise FloatingPointError(f"W3 trainable parameter has no gradient: {name}")
+        if not torch.isfinite(parameter.grad).all():
+            raise FloatingPointError(f"W3 trainable parameter has nonfinite gradient: {name}")
+        gradients.append((name, parameter.grad))
+    return _tensor_fingerprint(gradients)
+
+
 def _resolve_pinned_snapshot() -> Path:
     from huggingface_hub import snapshot_download  # noqa: PLC0415
 
@@ -225,6 +361,7 @@ def run_probe_worker(
     result: dict[str, Any] = {"rank": rank, "per_rank_batch_size": batch_size}
     process_group = False
     try:
+        _seed_everything(42)
         if mode == "ddp":
             torch.distributed.init_process_group("nccl", rank=rank, world_size=WORLD_SIZE)
             process_group = True
@@ -236,6 +373,8 @@ def run_probe_worker(
             model_dir=model_dir,
         )
         backbone.model.to(dtype=torch.bfloat16)
+        frozen_before = _parameter_fingerprint(model, trainable=False)
+        trainable_before = _parameter_fingerprint(model, trainable=True)
         train_dataset = TwoViewDataset(dataset.train, seed=42, training=True, preprocess=backbone.preprocess)
         sampler = make_sampler(train_dataset, seed=42, world_size=WORLD_SIZE, rank=rank)
         loader = torch.utils.data.DataLoader(
@@ -248,8 +387,9 @@ def run_probe_worker(
         batch = next(iter(loader))
         if mode == "ddp":
             model = DistributedDataParallel(model, device_ids=[rank], output_device=rank, broadcast_buffers=False)
+        base_model = model.module if isinstance(model, DistributedDataParallel) else model
         model.train()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-6, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+        optimizer, _ = create_optimizer(base_model, RunProtocol(per_rank_batch_size=batch_size))
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.reset_peak_memory_stats(device)
         output = model(
@@ -258,11 +398,44 @@ def run_probe_worker(
             batch["instructions"],
             batch["action_histories"].to(device),
         )
-        base_model = model.module if isinstance(model, DistributedDataParallel) else model
         loss, _ = base_model.contrastive_loss(output)
-        if not torch.isfinite(loss):
-            raise FloatingPointError("W3 probe loss is nonfinite")
+        if any(not torch.isfinite(value).all() for value in output.values()) or not torch.isfinite(loss):
+            raise FloatingPointError("W3 probe output or loss is nonfinite")
         loss.backward()
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            [parameter for parameter in base_model.parameters() if parameter.requires_grad],
+            RunProtocol().gradient_clip_norm,
+        )
+        if not torch.isfinite(torch.as_tensor(gradient_norm)):
+            raise FloatingPointError("W3 probe gradient norm is nonfinite")
+        gradient_fingerprint = _gradient_fingerprint(base_model)
+        optimizer.step()
+        with torch.no_grad():
+            base_model.logit_scale.clamp_(
+                0.0,
+                torch.log(torch.tensor(100.0, device=base_model.logit_scale.device)),
+            )
+        if not optimizer.state:
+            raise RuntimeError("W3 probe optimizer step did not initialize optimizer state")
+        parameters_finite = all(
+            torch.isfinite(parameter).all() for parameter in base_model.parameters() if parameter.requires_grad
+        )
+        trainable_changed = trainable_before != _parameter_fingerprint(base_model, trainable=True)
+        frozen_unchanged = frozen_before == _parameter_fingerprint(base_model, trainable=False)
+        frozen_dtypes = {str(parameter.dtype).removeprefix("torch.") for parameter in backbone.parameters()}
+        trainable_dtypes = {
+            str(parameter.dtype).removeprefix("torch.")
+            for parameter in base_model.parameters()
+            if parameter.requires_grad
+        }
+        if (
+            not parameters_finite
+            or not trainable_changed
+            or not frozen_unchanged
+            or frozen_dtypes != {"bfloat16"}
+            or trainable_dtypes != {"float32"}
+        ):
+            raise FloatingPointError("W3 probe state failed finite trainable/frozen invariants")
         if mode == "ddp":
             torch.distributed.barrier()
         torch.cuda.synchronize(device)
@@ -270,8 +443,32 @@ def run_probe_worker(
         result.update(
             {
                 "status": "passed",
-                "forward_backward": "passed",
+                "forward": "passed",
+                "backward": "passed",
+                "optimizer_step": "passed",
                 "loss": float(loss.detach().cpu()),
+                "gradient_norm": float(gradient_norm),
+                "gradients_finite": True,
+                "parameters_finite": True,
+                "trainable_state_changed": trainable_changed,
+                "frozen_state_unchanged": frozen_unchanged,
+                "gradient_fingerprint": gradient_fingerprint,
+                "local_negative_pool_size": batch_size,
+                "embedding_all_gather": False,
+                "frozen_backbone_dtype": frozen_dtypes.pop(),
+                "trainable_dtype": trainable_dtypes.pop(),
+                "logits_dtype": str(output["semantic_to_action_logits"].dtype).removeprefix("torch."),
+                "preprocessing_fingerprint": hashlib.sha256(repr(backbone.preprocess).encode()).hexdigest(),
+                "tokenizer_fingerprint": content_hash(
+                    {
+                        "loader": "open_clip",
+                        "backbone": BACKBONE_ID,
+                        "revision": BACKBONE_REVISION,
+                        "tokenizer_class": (
+                            f"{backbone.tokenizer.__class__.__module__}.{backbone.tokenizer.__class__.__qualname__}"
+                        ),
+                    }
+                ),
                 "max_memory_allocated_mib": round(torch.cuda.max_memory_allocated(device) / (1024**2), 2),
                 "max_memory_reserved_mib": round(torch.cuda.max_memory_reserved(device) / (1024**2), 2),
                 "free_memory_after_mib": round(free_bytes / (1024**2), 2),
@@ -347,7 +544,7 @@ def _run_worker_process(
             f"{completed.stderr[-2000:]}"
         )
     non_oom_failures = [result for result in results if result.get("failure") not in {None, "out_of_memory"}]
-    if completed.returncode != 0 and non_oom_failures:
+    if non_oom_failures:
         raise RuntimeError(f"W3 {mode} probe failed: {non_oom_failures}")
     return results
 
@@ -415,13 +612,22 @@ def run_real_batch_probe(
                     }
                 )
                 continue
+            validate_successful_rank_records(ddp, batch_size=batch_size)
+            preprocessing_fingerprints = {result["preprocessing_fingerprint"] for result in ddp}
+            tokenizer_fingerprints = {result["tokenizer_fingerprint"] for result in ddp}
+            if len(preprocessing_fingerprints) != 1 or len(tokenizer_fingerprints) != 1:
+                raise ValueError("W3 ranks loaded different preprocessing or tokenizer identities")
             attempts.append({"per_rank_batch_size": batch_size, "status": "passed", "ranks": ddp})
             receipt = build_probe_receipt(
                 snapshot=snapshot,
                 attempts=attempts,
                 selected_batch_size=batch_size,
                 memory_drift=memory_drift,
-                evidence=evidence,
+                evidence={
+                    **evidence,
+                    "preprocessing_fingerprint": preprocessing_fingerprints.pop(),
+                    "tokenizer_fingerprint": tokenizer_fingerprints.pop(),
+                },
             )
             write_canonical_json(Path(output_path), receipt)
             return receipt

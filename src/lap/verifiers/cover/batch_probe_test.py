@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from lap.verifiers.cover.batch_probe import build_probe_receipt
 from lap.verifiers.cover.batch_probe import compare_memory_to_baseline
 from lap.verifiers.cover.bridge_audit import build_production_target_inventory
@@ -31,6 +33,28 @@ def _snapshot():
     ]
 
 
+def _rank_success(rank: int, *, batch_size: int = 64, gradient_fingerprint: str = "a" * 64):
+    return {
+        "rank": rank,
+        "status": "passed",
+        "forward": "passed",
+        "backward": "passed",
+        "optimizer_step": "passed",
+        "loss": 1.25,
+        "gradient_norm": 0.5,
+        "gradients_finite": True,
+        "parameters_finite": True,
+        "trainable_state_changed": True,
+        "frozen_state_unchanged": True,
+        "gradient_fingerprint": gradient_fingerprint,
+        "local_negative_pool_size": batch_size,
+        "embedding_all_gather": False,
+        "frozen_backbone_dtype": "bfloat16",
+        "trainable_dtype": "float32",
+        "logits_dtype": "float32",
+    }
+
+
 def test_memory_drift_distinguishes_stable_and_transient_fields():
     report = compare_memory_to_baseline(_snapshot())
 
@@ -47,26 +71,116 @@ def test_probe_receipt_records_canonical_two_rank_success():
         snapshot=_snapshot(),
         attempts=[
             {
-                "per_rank_batch_size": 32,
+                "per_rank_batch_size": 64,
                 "status": "passed",
-                "ranks": [
-                    {"rank": 0, "forward_backward": "passed"},
-                    {"rank": 1, "forward_backward": "passed"},
-                ],
+                "ranks": [_rank_success(0), _rank_success(1)],
             }
         ],
-        selected_batch_size=32,
+        selected_batch_size=64,
         memory_drift=compare_memory_to_baseline(_snapshot()),
         evidence={
             "configuration": configuration,
             "configuration_hash": content_hash(configuration),
             "audit_manifest_sha256": "1" * 64,
             "target_inventory_fingerprint": build_production_target_inventory().fingerprint,
+            "preprocessing_fingerprint": "2" * 64,
+            "tokenizer_fingerprint": "3" * 64,
         },
     )
 
     validate_batch_probe_receipt(receipt)
-    assert receipt["selected_per_rank_batch_size"] == 32
-    assert receipt["successful_two_rank_forward_backward"]["ranks"] == [0, 1]
+    assert receipt["selected_per_rank_batch_size"] == 64
+    assert receipt["successful_two_rank_optimizer_step"] == {"batch_size": 64, "ranks": [0, 1]}
     assert receipt["model"]["backbone_revision"]
+    assert receipt["model"]["preprocessing_fingerprint"] == "2" * 64
+    assert receipt["model"]["tokenizer_fingerprint"] == "3" * 64
+    assert receipt["model"]["negative_pool"] == "rank_local"
     assert receipt["memory_drift"]["baseline_date"] == "2026-07-23"
+
+
+def test_probe_receipt_rejects_duplicate_or_incomplete_rank_success():
+    attempts = [
+        {
+            "per_rank_batch_size": 64,
+            "status": "passed",
+            "ranks": [_rank_success(0), _rank_success(0)],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="exactly ranks 0 and 1"):
+        build_probe_receipt(
+            snapshot=_snapshot(),
+            attempts=attempts,
+            selected_batch_size=64,
+            memory_drift=compare_memory_to_baseline(_snapshot()),
+        )
+
+
+def test_probe_receipt_rejects_rank_without_full_optimizer_evidence():
+    incomplete = _rank_success(1)
+    incomplete.pop("optimizer_step")
+
+    with pytest.raises(ValueError, match="full finite optimizer step"):
+        build_probe_receipt(
+            snapshot=_snapshot(),
+            attempts=[
+                {
+                    "per_rank_batch_size": 64,
+                    "status": "passed",
+                    "ranks": [_rank_success(0), incomplete],
+                }
+            ],
+            selected_batch_size=64,
+            memory_drift=compare_memory_to_baseline(_snapshot()),
+        )
+
+
+def test_receipt_validation_rejects_rehashed_invalid_rank_records():
+    receipt = build_probe_receipt(
+        snapshot=_snapshot(),
+        attempts=[
+            {
+                "per_rank_batch_size": 64,
+                "status": "passed",
+                "ranks": [_rank_success(0), _rank_success(1)],
+            }
+        ],
+        selected_batch_size=64,
+        memory_drift=compare_memory_to_baseline(_snapshot()),
+        evidence={
+            "configuration": VerifierConfig().to_dict(),
+            "configuration_hash": content_hash(VerifierConfig().to_dict()),
+            "audit_manifest_sha256": "1" * 64,
+            "target_inventory_fingerprint": build_production_target_inventory().fingerprint,
+        },
+    )
+    receipt["attempts"][0]["ranks"][1]["rank"] = 0
+    receipt.pop("content_hash")
+    receipt["content_hash"] = content_hash(receipt)
+
+    with pytest.raises(ValueError, match="exactly ranks 0 and 1"):
+        validate_batch_probe_receipt(receipt)
+
+
+def test_canonical_receipt_requires_per_rank_batch_64():
+    receipt = build_probe_receipt(
+        snapshot=_snapshot(),
+        attempts=[
+            {
+                "per_rank_batch_size": 32,
+                "status": "passed",
+                "ranks": [_rank_success(0, batch_size=32), _rank_success(1, batch_size=32)],
+            }
+        ],
+        selected_batch_size=32,
+        memory_drift=compare_memory_to_baseline(_snapshot()),
+        evidence={
+            "configuration": VerifierConfig().to_dict(),
+            "configuration_hash": content_hash(VerifierConfig().to_dict()),
+            "audit_manifest_sha256": "1" * 64,
+            "target_inventory_fingerprint": build_production_target_inventory().fingerprint,
+        },
+    )
+
+    with pytest.raises(ValueError, match="per-rank batch size 64"):
+        validate_batch_probe_receipt(receipt)

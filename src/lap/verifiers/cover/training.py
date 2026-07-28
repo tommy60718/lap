@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-import platform
 from typing import Any
 
 import torch
@@ -36,7 +34,13 @@ def train_one_batch(
 def create_optimizer(
     model: VerifierModel, protocol: RunProtocol
 ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
-    optimizer = torch.optim.AdamW(model.parameters(), lr=protocol.learning_rate)
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        lr=protocol.learning_rate,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.01,
+    )
 
     def schedule(epoch: int) -> float:
         if epoch < protocol.warmup_epochs:
@@ -44,55 +48,6 @@ def create_optimizer(
         return 1.0
 
     return optimizer, torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
-
-
-def _gpu_snapshot() -> list[dict[str, Any]]:
-    if not torch.cuda.is_available():
-        return []
-    snapshots = []
-    for index in range(torch.cuda.device_count()):
-        free, total = torch.cuda.mem_get_info(index)
-        properties = torch.cuda.get_device_properties(index)
-        snapshots.append(
-            {
-                "index": index,
-                "name": properties.name,
-                "physical_bytes": properties.total_memory,
-                "free_bytes": free,
-                "total_visible_bytes": total,
-            }
-        )
-    return snapshots
-
-
-def probe_batch_sizes(
-    model_factory, batch_factory, *, candidates: Iterable[int] = (64, 32, 16), device: torch.device | None = None
-) -> dict[str, Any]:
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    attempts = []
-    before = _gpu_snapshot()
-    for batch_size in candidates:
-        model = model_factory().to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-6)
-        try:
-            metrics = train_one_batch(model, batch_factory(batch_size, device), optimizer)
-            attempts.append({"batch_size": batch_size, "status": "passed", "metrics": metrics})
-            return {
-                "schema": "osx_cover_w3_batch_probe_v1",
-                "host": platform.node(),
-                "backbone": model.backbone.__class__.__name__,
-                "gpu_before": before,
-                "attempts": attempts,
-                "selected_per_rank_batch_size": batch_size,
-            }
-        except (RuntimeError, FloatingPointError) as error:
-            message = str(error)
-            if isinstance(error, RuntimeError) and "out of memory" not in message.lower():
-                raise
-            attempts.append({"batch_size": batch_size, "status": "failed", "error": type(error).__name__})
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-    raise RuntimeError("no W3 batch size fit the approved probe order")
 
 
 def make_base_only_config(config: VerifierConfig) -> VerifierConfig:

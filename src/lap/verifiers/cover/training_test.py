@@ -47,6 +47,18 @@ def test_one_batch_updates_trainable_state_only():
     assert all(torch.equal(before[name], value) for name, value in model.named_parameters() if not value.requires_grad)
 
 
+def test_optimizer_contains_only_trainable_verifier_parameters():
+    model = _model()
+    optimizer, _ = create_optimizer(model, RunProtocol())
+
+    optimized = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
+    trainable = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    frozen = {id(parameter) for parameter in model.backbone.parameters()}
+
+    assert optimized == trainable
+    assert optimized.isdisjoint(frozen)
+
+
 def test_base_only_config_changes_only_wrist_fusion_contract():
     two_view = _model().config
     base = make_base_only_config(two_view)

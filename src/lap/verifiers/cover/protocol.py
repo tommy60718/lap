@@ -436,10 +436,28 @@ def _validate_model_identity(identity: Mapping[str, Any], *, require_canonical: 
             raise ValueError("batch receipt must identify the pinned SigLIP2 backbone")
         if identity.get("backbone_revision") not in {None, BACKBONE_REVISION}:
             raise ValueError("batch receipt backbone revision drifted")
-        for field in ("configuration_hash", "audit_manifest_sha256", "target_inventory_fingerprint"):
+        for field in (
+            "configuration_hash",
+            "audit_manifest_sha256",
+            "target_inventory_fingerprint",
+            "preprocessing_fingerprint",
+            "tokenizer_fingerprint",
+        ):
             value = identity.get(field)
             if not isinstance(value, str) or len(value) != 64:
                 raise ValueError(f"batch receipt model identity missing {field}")
+        expected_execution = {
+            "two_view": True,
+            "negative_pool": "rank_local",
+            "gradient_synchronization": "two_rank_ddp",
+            "trainable_dtype": "float32",
+            "frozen_backbone_dtype": "bfloat16",
+            "logits_dtype": "float32",
+            "frozen_encoder_autocast": "cuda_bfloat16",
+        }
+        for field, expected in expected_execution.items():
+            if identity.get(field) != expected:
+                raise ValueError(f"batch receipt model identity has invalid {field}")
 
 
 def _project_root() -> Path:
@@ -539,84 +557,16 @@ def probe_batch_sizes(
     model_identity: Mapping[str, Any] | None = None,
     candidates: Sequence[int] = PROBE_ORDER,
 ) -> dict[str, Any]:
-    """Run an injectable two-rank, forward/backward-only batch-size probe.
+    """Compatibility delegate to the sole probe owner in ``batch_probe``."""
 
-    ``step_fn`` owns model construction, DDP setup, one forward/backward step,
-    cleanup, and finite-result checks.  It is called once per rank.  The
-    default snapshot is real NVIDIA/PyTorch state; tests inject both seams.
-    """
+    from lap.verifiers.cover.batch_probe import probe_batch_sizes as owned_probe_batch_sizes  # noqa: PLC0415
 
-    if tuple(candidates) != PROBE_ORDER:
-        raise ValueError("W3 batch probe order is fixed at 64, 32, 16")
-    gpu_snapshot = [_jsonable(gpu) for gpu in snapshot_fn()]
-    _validate_gpu_snapshot(gpu_snapshot)
-    identity = dict(model_identity or {"backbone": BACKBONE_ID, "backbone_revision": BACKBONE_REVISION})
-    _validate_model_identity(identity, require_canonical=False)
-    project_root = Path(__file__).resolve().parents[4]
-    environment = {
-        "python_executable": sys.executable,
-        "python": platform.python_version(),
-        "torch": torch.__version__,
-        "cuda_build": torch.version.cuda,
-        "lap_revision": subprocess.check_output(
-            ["git", "-C", str(project_root), "rev-parse", "HEAD"], text=True
-        ).strip(),
-        "pyproject_sha256": sha256_file(project_root / "pyproject.toml"),
-        "uv_lock_sha256": sha256_file(project_root / "uv.lock"),
-        "siglip2_snapshot": {"backbone_id": BACKBONE_ID, "revision": BACKBONE_REVISION},
-    }
-    attempts = []
-    for batch_size in PROBE_ORDER:
-        rank_results = []
-        try:
-            for rank, gpu in enumerate(gpu_snapshot):
-                result = step_fn(batch_size, rank, gpu)
-                result = {} if result is None else dict(result)
-                if result.get("status") == "failed":
-                    error = RuntimeError(str(result.get("error", "probe step failed")))
-                    if not _is_oom(error):
-                        raise error
-                    raise error
-                result.setdefault("forward_backward", "passed")
-                rank_results.append(_jsonable(result))
-        except BaseException as error:
-            if not _is_oom(error):
-                raise
-            attempts.append(
-                {
-                    "per_rank_batch_size": batch_size,
-                    "status": "failed",
-                    "failure": "out_of_memory",
-                    "error_type": type(error).__name__,
-                    "ranks_completed": len(rank_results),
-                }
-            )
-            continue
-        attempts.append(
-            {
-                "per_rank_batch_size": batch_size,
-                "status": "passed",
-                "ranks": rank_results,
-            }
-        )
-        return _with_content_hash(
-            {
-                "schema": "osx_cover_w3_batch_probe_v2",
-                "status": "complete",
-                "host": platform.node(),
-                "world_size": WORLD_SIZE,
-                "probe_order": list(PROBE_ORDER),
-                "attempted_batch_sizes": [attempt["per_rank_batch_size"] for attempt in attempts],
-                "selected_per_rank_batch_size": batch_size,
-                "selection_rule": "first_successful_two_rank_forward_backward",
-                "gpu_snapshot": gpu_snapshot,
-                "environment": environment,
-                "model": _jsonable(identity),
-                "successful_two_rank_forward_backward": {"batch_size": batch_size, "ranks": [0, 1]},
-                "attempts": attempts,
-            }
-        )
-    raise RuntimeError("no W3 batch size fit the approved two-rank probe order")
+    return owned_probe_batch_sizes(
+        step_fn,
+        snapshot_fn=snapshot_fn,
+        model_identity=model_identity,
+        candidates=candidates,
+    )
 
 
 def validate_batch_probe_receipt(
@@ -674,6 +624,8 @@ def validate_batch_probe_receipt(
     selected = payload.get("selected_per_rank_batch_size")
     if selected not in PROBE_ORDER:
         raise ValueError("batch probe receipt has no approved selected batch size")
+    if require_canonical and selected != 64:
+        raise ValueError("canonical W3 receipt must prove per-rank batch size 64")
     attempts = payload.get("attempts", [])
     if [attempt["per_rank_batch_size"] for attempt in attempts] != payload.get("attempted_batch_sizes"):
         raise ValueError("batch probe attempts are not recorded in order")
@@ -682,8 +634,13 @@ def validate_batch_probe_receipt(
         raise ValueError("batch probe receipt does not identify the first successful size")
     if successful[0].get("ranks") is None or len(successful[0]["ranks"]) != WORLD_SIZE:
         raise ValueError("batch probe success did not run both ranks")
-    if payload.get("successful_two_rank_forward_backward", {}).get("ranks") != [0, 1]:
-        raise ValueError("batch probe receipt lacks a two-rank success result")
+    from lap.verifiers.cover.batch_probe import validate_successful_rank_records  # noqa: PLC0415
+
+    validate_successful_rank_records(successful[0]["ranks"], batch_size=selected)
+    if payload.get("selection_rule") != "first_successful_two_rank_optimizer_step":
+        raise ValueError("batch probe receipt does not prove the accepted optimizer-step selection rule")
+    if payload.get("successful_two_rank_optimizer_step") != {"batch_size": selected, "ranks": [0, 1]}:
+        raise ValueError("batch probe receipt lacks a two-rank optimizer-step result")
 
 
 def materialize_protocol(

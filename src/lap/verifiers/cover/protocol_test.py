@@ -44,6 +44,8 @@ def _canonical_model_identity(*, audit_manifest_sha256: str = "1" * 64):
         "configuration_hash": content_hash(configuration),
         "audit_manifest_sha256": audit_manifest_sha256,
         "target_inventory_fingerprint": build_production_target_inventory().fingerprint,
+        "preprocessing_fingerprint": "2" * 64,
+        "tokenizer_fingerprint": "3" * 64,
     }
 
 
@@ -68,6 +70,28 @@ def _canonical_gpu_snapshots():
             "free_memory_mib": 47100,
         },
     ]
+
+
+def _rank_success(batch_size: int, rank: int, _gpu):
+    return {
+        "rank": rank,
+        "status": "passed",
+        "forward": "passed",
+        "backward": "passed",
+        "optimizer_step": "passed",
+        "loss": 1.25,
+        "gradient_norm": 0.5,
+        "gradients_finite": True,
+        "parameters_finite": True,
+        "trainable_state_changed": True,
+        "frozen_state_unchanged": True,
+        "gradient_fingerprint": "a" * 64,
+        "local_negative_pool_size": batch_size,
+        "embedding_all_gather": False,
+        "frozen_backbone_dtype": "bfloat16",
+        "trainable_dtype": "float32",
+        "logits_dtype": "float32",
+    }
 
 
 def test_revision_drift_classification_ignores_only_non_runtime_w3_paths():
@@ -151,7 +175,7 @@ def test_batch_probe_records_two_gpu_attempts_and_first_success():
         calls.append((batch_size, rank))
         if batch_size == 64:
             raise RuntimeError("CUDA out of memory")
-        return {"forward_backward": "passed", "rank": rank, "batch_size": batch_size}
+        return _rank_success(batch_size, rank, _gpu)
 
     receipt = probe_batch_sizes(
         step,
@@ -167,13 +191,13 @@ def test_batch_probe_records_two_gpu_attempts_and_first_success():
     assert receipt["attempted_batch_sizes"] == list(PROBE_ORDER[:2])
     assert receipt["selected_per_rank_batch_size"] == 32
     assert receipt["gpu_snapshot"] == snapshots
-    assert receipt["successful_two_rank_forward_backward"]["ranks"] == [0, 1]
+    assert receipt["successful_two_rank_optimizer_step"]["ranks"] == [0, 1]
     assert calls == [(64, 0), (32, 0), (32, 1)]
 
 
 def test_tiny_probe_cannot_be_materialized_as_canonical(tmp_path):
     receipt = probe_batch_sizes(
-        lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
+        _rank_success,
         snapshot_fn=lambda: [
             {
                 "index": 0,
@@ -415,7 +439,7 @@ def test_protocol_core_rejects_rehashed_phrase_contract_drift(tmp_path):
 
 def test_materialized_protocol_is_hashable_and_rejects_drift(tmp_path):
     receipt = probe_batch_sizes(
-        lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
+        _rank_success,
         snapshot_fn=_canonical_gpu_snapshots,
         model_identity=_canonical_model_identity(),
     )
@@ -440,7 +464,7 @@ def test_materialized_protocol_is_hashable_and_rejects_drift(tmp_path):
 
 def test_canonical_batch_receipt_rejects_rehashed_identity_drift():
     receipt = probe_batch_sizes(
-        lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
+        _rank_success,
         snapshot_fn=_canonical_gpu_snapshots,
         model_identity=_canonical_model_identity(),
     )
@@ -455,7 +479,7 @@ def test_canonical_batch_receipt_rejects_rehashed_identity_drift():
 
 def test_canonical_batch_receipt_must_match_supplied_audit():
     receipt = probe_batch_sizes(
-        lambda batch_size, rank, _gpu: {"forward_backward": "passed", "batch_size": batch_size, "rank": rank},
+        _rank_success,
         snapshot_fn=_canonical_gpu_snapshots,
         model_identity=_canonical_model_identity(audit_manifest_sha256="a" * 64),
     )
