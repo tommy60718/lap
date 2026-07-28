@@ -50,11 +50,11 @@ APPROVED_SHUFFLED_EXCLUSIONS = (
 
 _EXPECTED_BACKBONE_NAMES = {BACKBONE_ID, "hf-hub:timm/ViT-L-16-SigLIP2-384"}
 _JSON_ARTIFACTS = {
+    "validation_semantics": "validation_semantics.json",
     "rephrase_manifest": "rephrase_manifest.json",
     "shuffled_pairs": "shuffled_pairs.json",
     "shuffled_exclusions": "shuffled_exclusions.json",
     "nearby_pairs": "nearby_pairs.json",
-    "batch_probe_receipt": "batch_probe_receipt.json",
 }
 
 
@@ -87,7 +87,7 @@ def build_phrase_manifest() -> dict[str, Any]:
             "templates": list(PHRASE_TEMPLATES),
             "phrases": phrases,
             "selection": {
-                "method": "sha256(seed:epoch:sample_id) modulo variants_for_shape",
+                "method": "sha256(seed:epoch:sample_id:shape) modulo variants_for_shape",
                 "seed": TRAINING_SEED,
             },
             "validation_language": "canonical_w2_instruction",
@@ -100,7 +100,7 @@ def select_training_phrase(*, seed: int, epoch: int, sample_id: str, shape: str)
 
     if shape not in {"circular", "square"}:
         raise ValueError(f"unsupported peg shape: {shape}")
-    digest = hashlib.sha256(f"{seed}:{epoch}:{sample_id}".encode()).digest()
+    digest = hashlib.sha256(f"{seed}:{epoch}:{sample_id}:{shape}".encode()).digest()
     index = int.from_bytes(digest[:8], "big") % len(PHRASE_TEMPLATES)
     return PHRASE_TEMPLATES[index].format(shape=shape)
 
@@ -160,9 +160,13 @@ class RunProtocol:
                 "seed": self.seed,
                 "negative_pool": "local_per_rank",
                 "world_size": self.world_size,
+                "gradient_synchronization": "two_rank_ddp",
+                "embedding_all_gather": False,
+                "gradient_accumulation_enlarges_negative_pool": False,
                 "trainable_dtype": "float32",
                 "frozen_backbone_dtype": "bfloat16",
                 "automatic_mixed_precision": "disabled_for_trainable_modules",
+                "nonfinite_policy": "stop_run_and_prevent_accepted_publication",
             },
             "batch": {
                 "per_rank": self.per_rank_batch_size,
@@ -179,6 +183,10 @@ class RunProtocol:
                 "warmup_epochs": self.warmup_epochs,
                 "scheduler": "10_epoch_linear_warmup_then_constant",
                 "gradient_clip_norm": self.gradient_clip_norm,
+            },
+            "logit_scale": {
+                "initial_logit_scale": 2.6592,
+                "exponentiated_scale_bounds": [1.0, 100.0],
             },
             "evaluation": {
                 "seed": self.evaluation_seed,
@@ -235,6 +243,20 @@ def sampler_indices(
 
 def _row_shape(row: Mapping[str, Any]) -> str | None:
     return row.get("traceability", {}).get("peg_shape")
+
+
+def _validation_semantics(validation: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema": "osx_cover_w3_validation_semantics_v1",
+        "rows": [
+            {
+                "sample_id": str(row["sample_id"]),
+                "episode_id": str(row["episode_id"]),
+                "peg_shape": _row_shape(row),
+            }
+            for row in validation
+        ],
+    }
 
 
 def build_shuffled_pairs(
@@ -663,22 +685,6 @@ def validate_batch_probe_receipt(
         raise ValueError("batch probe receipt lacks a two-rank success result")
 
 
-def _pending_batch_probe_receipt() -> dict[str, Any]:
-    return _with_content_hash(
-        {
-            "schema": "osx_cover_w3_batch_probe_v2",
-            "status": "pending_real_two_rank_probe",
-            "world_size": WORLD_SIZE,
-            "probe_order": list(PROBE_ORDER),
-            "attempted_batch_sizes": [],
-            "selected_per_rank_batch_size": None,
-            "model": {"canonical_target": False, "reason": "GPU probe not run"},
-            "gpu_snapshot": [],
-            "attempts": [],
-        }
-    )
-
-
 def materialize_protocol(
     output_dir: Path,
     *,
@@ -693,6 +699,10 @@ def materialize_protocol(
     del per_rank_batch_size  # A bare integer is never evidence for canonical W3.
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    validation_semantics_hash = write_canonical_json(
+        output_dir / "validation_semantics.json",
+        _validation_semantics(validation),
+    )
     phrase_hash = write_canonical_json(output_dir / "rephrase_manifest.json", build_phrase_manifest())
     shuffled, excluded = build_shuffled_pairs(validation)
     nearby, nearby_excluded = build_nearby_pairs(validation)
@@ -715,27 +725,27 @@ def materialize_protocol(
     np.save(output_dir / "bootstrap_indices.npy", bootstrap, allow_pickle=False)
     bootstrap_hash = sha256_file(output_dir / "bootstrap_indices.npy")
 
-    if batch_probe_receipt is None:
-        receipt = _pending_batch_probe_receipt()
-    else:
-        receipt = dict(batch_probe_receipt)
+    receipt = None if batch_probe_receipt is None else dict(batch_probe_receipt)
+    if receipt is not None:
         validate_batch_probe_receipt(receipt, require_canonical=True)
-    receipt_hash = write_canonical_json(output_dir / "batch_probe_receipt.json", receipt)
+        receipt_hash = write_canonical_json(output_dir / "batch_probe_receipt.json", receipt)
     protocol = RunProtocol(
-        per_rank_batch_size=receipt.get("selected_per_rank_batch_size"),
+        per_rank_batch_size=None if receipt is None else receipt.get("selected_per_rank_batch_size"),
     ).to_dict(train_manifest_hash=train_manifest_hash, phrase_manifest_hash=phrase_hash)
-    protocol["batch"]["per_rank"] = receipt.get("selected_per_rank_batch_size")
-    protocol["status"] = "complete" if receipt.get("status") == "complete" else "incomplete_pending_batch_probe"
+    protocol["identities"]["validation_semantics_hash"] = validation_semantics_hash
+    protocol["status"] = "protocol_core" if receipt is None else "complete"
     protocol["evaluation"]["episode_ids"] = ordered_episode_ids
     protocol["artifacts"] = {
+        "validation_semantics": validation_semantics_hash,
         "rephrase_manifest": phrase_hash,
         "shuffled_pairs": shuffled_hash,
         "shuffled_exclusions": exclusion_hash,
         "nearby_pairs": nearby_hash,
         "bootstrap_indices": bootstrap_hash,
-        "batch_probe_receipt": receipt_hash,
     }
-    if batch_probe_hash is not None and batch_probe_hash != receipt_hash:
+    if receipt is not None:
+        protocol["artifacts"]["batch_probe_receipt"] = receipt_hash
+    if batch_probe_hash is not None and (receipt is None or batch_probe_hash != receipt_hash):
         raise ValueError("external batch probe hash does not match the materialized receipt")
     protocol_hash = write_canonical_json(output_dir / "run_protocol.json", protocol)
     return {**protocol["artifacts"], "run_protocol": protocol_hash}
@@ -754,6 +764,7 @@ def validate_protocol_directory(
     output_dir: Path,
     *,
     require_complete: bool = True,
+    validation: Sequence[dict[str, Any]] | None = None,
     expected_audit_manifest_sha256: str | None = None,
     expected_target_inventory_fingerprint: str | None = None,
 ) -> dict[str, Any]:
@@ -763,38 +774,62 @@ def validate_protocol_directory(
     payload = _read_hashed_json(output_dir / "run_protocol.json")
     if payload.get("schema") != W3_PROTOCOL_SCHEMA:
         raise ValueError("wrong W3 protocol schema")
-    if payload.get("seed") != TRAINING_SEED or payload.get("sampler", {}).get("seed") != TRAINING_SEED:
-        raise ValueError("training/sampler seed drifted")
-    if payload.get("evaluation", {}).get("seed") != EVALUATION_SEED:
-        raise ValueError("evaluation seed drifted")
-    if payload.get("sampler", {}).get("world_size") != WORLD_SIZE:
-        raise ValueError("world_size drifted")
-    if payload.get("sampler", {}).get("type") != "DistributedSampler":
-        raise ValueError("sampler type drifted")
-    if payload.get("batch", {}).get("probe_order") != list(PROBE_ORDER):
-        raise ValueError("batch probe order drifted")
-    if payload.get("optimization", {}).get("optimizer") != "AdamW":
-        raise ValueError("optimizer drifted")
-    if payload.get("optimization", {}).get("betas") != [0.9, 0.999]:
-        raise ValueError("optimizer betas drifted")
-    if payload.get("optimization", {}).get("epsilon") != 1e-8:
-        raise ValueError("optimizer epsilon drifted")
-    if payload.get("optimization", {}).get("weight_decay") != 0.01:
-        raise ValueError("optimizer weight decay drifted")
-    if payload.get("training", {}).get("negative_pool") != "local_per_rank":
-        raise ValueError("negative-pool contract drifted")
-    if payload.get("training", {}).get("trainable_dtype") != "float32":
-        raise ValueError("trainable dtype drifted")
-    if payload.get("training", {}).get("frozen_backbone_dtype") != "bfloat16":
-        raise ValueError("frozen dtype drifted")
-
     artifacts = payload.get("artifacts", {})
+    identities = payload.get("identities", {})
+    train_manifest_hash = identities.get("train_manifest_hash")
+    if not isinstance(train_manifest_hash, str) or len(train_manifest_hash) != 64:
+        raise ValueError("protocol train-manifest identity is invalid")
+    validation_semantics_hash = identities.get("validation_semantics_hash")
+    if not isinstance(validation_semantics_hash, str) or len(validation_semantics_hash) != 64:
+        raise ValueError("protocol validation-semantics identity is invalid")
+    if validation is not None and validation_semantics_hash != content_hash(_validation_semantics(validation)):
+        raise ValueError("protocol validation-semantics identity drifted from the immutable W2 input")
+    has_capacity_evidence = "batch_probe_receipt" in artifacts
+    selected = payload.get("batch", {}).get("per_rank") if has_capacity_evidence else None
+    expected = RunProtocol(per_rank_batch_size=selected).to_dict(
+        train_manifest_hash=train_manifest_hash,
+        phrase_manifest_hash=artifacts.get("rephrase_manifest"),
+    )
+    expected["identities"]["validation_semantics_hash"] = validation_semantics_hash
+    expected["evaluation"]["episode_ids"] = payload.get("evaluation", {}).get("episode_ids")
+    for field in (
+        "protocol_version",
+        "seed",
+        "sampler",
+        "training",
+        "batch",
+        "optimization",
+        "logit_scale",
+        "evaluation",
+        "identities",
+    ):
+        if payload.get(field) != expected[field]:
+            raise ValueError(f"{field} contract drifted")
+    expected_status = "complete" if has_capacity_evidence else "protocol_core"
+    if payload.get("status") != expected_status:
+        raise ValueError("protocol status does not match its capacity evidence")
+
     materialized: dict[str, Any] = {"protocol": payload}
     for key, filename in _JSON_ARTIFACTS.items():
         artifact = _read_hashed_json(output_dir / filename)
         if artifacts.get(key) != artifact["content_hash"]:
             raise ValueError(f"{filename} hash is not recorded by run_protocol.json")
         materialized[key] = artifact
+    stored_validation_semantics = materialized["validation_semantics"]
+    if stored_validation_semantics.get("schema") != "osx_cover_w3_validation_semantics_v1":
+        raise ValueError("validation-semantics schema drifted")
+    if validation_semantics_hash != stored_validation_semantics["content_hash"]:
+        raise ValueError("protocol validation-semantics identity is not bound to its artifact")
+    if validation is not None and stored_validation_semantics != _with_content_hash(_validation_semantics(validation)):
+        raise ValueError("validation-semantics artifact drifted from the immutable W2 input")
+    semantic_validation = [
+        {
+            "sample_id": row["sample_id"],
+            "episode_id": row["episode_id"],
+            "traceability": {"peg_shape": row["peg_shape"]},
+        }
+        for row in stored_validation_semantics.get("rows", [])
+    ]
     bootstrap_path = output_dir / "bootstrap_indices.npy"
     bootstrap_hash = sha256_file(bootstrap_path)
     if artifacts.get("bootstrap_indices") != bootstrap_hash:
@@ -802,22 +837,60 @@ def validate_protocol_directory(
     bootstrap = np.load(bootstrap_path, allow_pickle=False)
     if bootstrap.shape != (BOOTSTRAP_REPLICATES, 8) or bootstrap.dtype != np.int64:
         raise ValueError("bootstrap matrix shape or dtype drifted")
+    expected_episode_ids = sorted({str(row["episode_id"]) for row in semantic_validation})
+    if payload["evaluation"]["episode_ids"] != expected_episode_ids:
+        raise ValueError("evaluation episode identities drifted from the immutable W2 validation input")
+    expected_bootstrap = build_bootstrap_indices(expected_episode_ids)
+    if not np.array_equal(bootstrap, expected_bootstrap):
+        raise ValueError("bootstrap semantics drifted from the immutable W2 validation input")
     materialized["bootstrap_indices"] = bootstrap
 
-    if materialized["rephrase_manifest"].get("phrases") != build_phrase_manifest().get("phrases"):
-        raise ValueError("phrase manifest drifted")
+    receipt_path = output_dir / "batch_probe_receipt.json"
+    if "batch_probe_receipt" in artifacts:
+        receipt = _read_hashed_json(receipt_path)
+        if artifacts["batch_probe_receipt"] != receipt["content_hash"]:
+            raise ValueError("batch_probe_receipt.json hash is not recorded by run_protocol.json")
+        materialized["batch_probe_receipt"] = receipt
+    elif receipt_path.exists():
+        raise ValueError("unrecorded batch_probe_receipt.json is not part of the protocol core")
+
+    if materialized["rephrase_manifest"] != build_phrase_manifest():
+        raise ValueError("phrase manifest contract drifted")
     if materialized["shuffled_exclusions"].get("sample_ids") != list(APPROVED_SHUFFLED_EXCLUSIONS):
         raise ValueError("approved shuffled exclusions drifted")
     if len(materialized["shuffled_pairs"].get("pairs", [])) != SHUFFLED_COUNT:
         raise ValueError("shuffled pair count drifted")
+    expected_shuffled, expected_exclusions = build_shuffled_pairs(semantic_validation)
+    if materialized["shuffled_pairs"] != _with_content_hash(
+        {"schema": "osx_cover_w3_shuffled_pairs_v1", "pairs": expected_shuffled}
+    ):
+        raise ValueError("shuffled pair semantics drifted from the immutable W2 validation input")
+    if materialized["shuffled_exclusions"] != _with_content_hash(
+        {"schema": "osx_cover_w3_shuffled_exclusions_v1", "sample_ids": expected_exclusions}
+    ):
+        raise ValueError("shuffled exclusion semantics drifted from the immutable W2 validation input")
     if len(materialized["nearby_pairs"].get("pairs", [])) != VALIDATION_COUNT:
         raise ValueError("nearby pair count drifted")
-    validate_batch_probe_receipt(
-        materialized["batch_probe_receipt"],
-        require_canonical=require_complete,
-        expected_audit_manifest_sha256=expected_audit_manifest_sha256,
-        expected_target_inventory_fingerprint=expected_target_inventory_fingerprint,
-    )
+    expected_nearby, expected_nearby_exclusions = build_nearby_pairs(semantic_validation)
+    if materialized["nearby_pairs"] != _with_content_hash(
+        {
+            "schema": "osx_cover_w3_nearby_pairs_v1",
+            "pairs": expected_nearby,
+            "excluded": expected_nearby_exclusions,
+        }
+    ):
+        raise ValueError("nearby pair semantics drifted from the immutable W2 validation input")
+    if "batch_probe_receipt" in materialized:
+        validate_batch_probe_receipt(
+            materialized["batch_probe_receipt"],
+            require_canonical=require_complete,
+            expected_audit_manifest_sha256=expected_audit_manifest_sha256,
+            expected_target_inventory_fingerprint=expected_target_inventory_fingerprint,
+        )
+        if selected != materialized["batch_probe_receipt"].get("selected_per_rank_batch_size"):
+            raise ValueError("batch contract does not match the capacity receipt")
+    elif require_complete:
+        raise ValueError("W3 protocol is incomplete without the real two-rank batch probe")
     if require_complete and payload.get("status") != "complete":
         raise ValueError("W3 protocol is incomplete pending the real two-rank batch probe")
     selected = payload.get("batch", {}).get("per_rank")

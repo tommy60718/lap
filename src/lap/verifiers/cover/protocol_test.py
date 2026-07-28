@@ -25,6 +25,8 @@ from lap.verifiers.cover.protocol import select_training_phrase
 from lap.verifiers.cover.protocol import validate_batch_probe_receipt
 from lap.verifiers.cover.protocol import validate_protocol_directory
 from lap.verifiers.cover.w3_contracts import content_hash
+from lap.verifiers.cover.w3_contracts import sha256_file
+from lap.verifiers.cover.w3_contracts import write_canonical_json
 
 CANONICAL_EXPORT = Path(__file__).resolve().parents[6] / ".w2_canonical_export_v3"
 
@@ -201,6 +203,201 @@ def test_tiny_probe_cannot_be_materialized_as_canonical(tmp_path):
             validation=_canonical_validation_rows(),
             batch_probe_receipt=receipt,
         )
+
+
+def test_protocol_core_neither_requires_nor_invents_capacity_evidence(tmp_path):
+    hashes = materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=_canonical_validation_rows(),
+    )
+
+    assert "batch_probe_receipt" not in hashes
+    assert not (tmp_path / "batch_probe_receipt.json").exists()
+    validated = validate_protocol_directory(tmp_path, require_complete=False)
+    assert "batch_probe_receipt" not in validated
+    assert validated["protocol"]["batch"]["per_rank"] is None
+
+
+def test_protocol_core_versions_the_complete_accepted_training_semantics(tmp_path):
+    materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=_canonical_validation_rows(),
+    )
+
+    protocol = validate_protocol_directory(tmp_path, require_complete=False)["protocol"]
+    assert protocol["training"]["gradient_synchronization"] == "two_rank_ddp"
+    assert protocol["training"]["embedding_all_gather"] is False
+    assert protocol["training"]["gradient_accumulation_enlarges_negative_pool"] is False
+    assert protocol["training"]["nonfinite_policy"] == "stop_run_and_prevent_accepted_publication"
+    assert protocol["logit_scale"] == {
+        "initial_logit_scale": 2.6592,
+        "exponentiated_scale_bounds": [1.0, 100.0],
+    }
+    phrase_manifest = json.loads((tmp_path / "rephrase_manifest.json").read_text(encoding="utf-8"))
+    assert phrase_manifest["selection"]["method"] == "sha256(seed:epoch:sample_id:shape) modulo variants_for_shape"
+
+
+def test_protocol_core_rejects_rehashed_optimizer_semantic_drift(tmp_path):
+    materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=_canonical_validation_rows(),
+    )
+    protocol_path = tmp_path / "run_protocol.json"
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    protocol["optimization"]["learning_rate"] = 2e-6
+    write_canonical_json(protocol_path, protocol)
+
+    with pytest.raises(ValueError, match="optimization"):
+        validate_protocol_directory(tmp_path, require_complete=False)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "drifted_value"),
+    [
+        (("protocol_version",), "validation-selected-v2"),
+        (("sampler", "shuffle"), False),
+        (("training", "embedding_all_gather"), True),
+        (("batch", "selection"), "validation_selected"),
+        (("logit_scale", "initial_logit_scale"), 3.0),
+        (("evaluation", "top_k"), [1]),
+        (("status",), "complete"),
+    ],
+)
+def test_protocol_core_rejects_rehashed_semantic_drift(tmp_path, field_path, drifted_value):
+    materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=_canonical_validation_rows(),
+    )
+    protocol_path = tmp_path / "run_protocol.json"
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    target = protocol
+    for field in field_path[:-1]:
+        target = target[field]
+    target[field_path[-1]] = drifted_value
+    write_canonical_json(protocol_path, protocol)
+
+    with pytest.raises(ValueError, match=r"contract|status"):
+        validate_protocol_directory(tmp_path, require_complete=False)
+
+
+def test_protocol_core_rejects_rehashed_shuffled_pair_semantic_drift(tmp_path):
+    validation = _canonical_validation_rows()
+    materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=validation,
+    )
+    shuffled_path = tmp_path / "shuffled_pairs.json"
+    shuffled = json.loads(shuffled_path.read_text(encoding="utf-8"))
+    shuffled["pairs"][0]["history_sample_id"] = shuffled["pairs"][0]["semantic_sample_id"]
+    shuffled_hash = write_canonical_json(shuffled_path, shuffled)
+    protocol_path = tmp_path / "run_protocol.json"
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    protocol["artifacts"]["shuffled_pairs"] = shuffled_hash
+    write_canonical_json(protocol_path, protocol)
+
+    with pytest.raises(ValueError, match="shuffled"):
+        validate_protocol_directory(tmp_path, require_complete=False)
+
+
+def test_protocol_core_rejects_rehashed_nearby_pair_semantic_drift(tmp_path):
+    validation = _canonical_validation_rows()
+    materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=validation,
+    )
+    nearby_path = tmp_path / "nearby_pairs.json"
+    nearby = json.loads(nearby_path.read_text(encoding="utf-8"))
+    nearby["pairs"][0]["history_sample_id"] = nearby["pairs"][0]["semantic_sample_id"]
+    nearby_hash = write_canonical_json(nearby_path, nearby)
+    protocol_path = tmp_path / "run_protocol.json"
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    protocol["artifacts"]["nearby_pairs"] = nearby_hash
+    write_canonical_json(protocol_path, protocol)
+
+    with pytest.raises(ValueError, match="nearby"):
+        validate_protocol_directory(tmp_path, require_complete=False, validation=validation)
+
+
+def test_protocol_core_rejects_rehashed_bootstrap_semantic_drift(tmp_path):
+    validation = _canonical_validation_rows()
+    materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=validation,
+    )
+    bootstrap_path = tmp_path / "bootstrap_indices.npy"
+    bootstrap = np.load(bootstrap_path, allow_pickle=False)
+    bootstrap[0, 0] = (bootstrap[0, 0] + 1) % 8
+    np.save(bootstrap_path, bootstrap, allow_pickle=False)
+    protocol_path = tmp_path / "run_protocol.json"
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    protocol["artifacts"]["bootstrap_indices"] = sha256_file(bootstrap_path)
+    write_canonical_json(protocol_path, protocol)
+
+    with pytest.raises(ValueError, match="bootstrap"):
+        validate_protocol_directory(tmp_path, require_complete=False, validation=validation)
+
+
+def test_protocol_core_binds_the_immutable_w2_validation_semantics(tmp_path):
+    validation = _canonical_validation_rows()
+    materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=validation,
+    )
+
+    protocol = validate_protocol_directory(tmp_path, require_complete=False, validation=validation)["protocol"]
+    assert (
+        protocol["identities"]["validation_semantics_hash"]
+        == "4d7d9ad47ab47f5c8ada380e8b9e7ceef6a22bc32d2c519d901b0e7b909f8e4f"
+    )
+
+
+def test_protocol_core_repeated_materialization_is_byte_identical(tmp_path):
+    validation = _canonical_validation_rows()
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first_hashes = materialize_protocol(
+        first,
+        train_manifest_hash="a" * 64,
+        validation=validation,
+    )
+    second_hashes = materialize_protocol(
+        second,
+        train_manifest_hash="a" * 64,
+        validation=validation,
+    )
+
+    assert first_hashes == second_hashes
+    assert {path.name: path.read_bytes() for path in first.iterdir()} == {
+        path.name: path.read_bytes() for path in second.iterdir()
+    }
+
+
+def test_protocol_core_rejects_rehashed_phrase_contract_drift(tmp_path):
+    materialize_protocol(
+        tmp_path,
+        train_manifest_hash="a" * 64,
+        validation=_canonical_validation_rows(),
+    )
+    phrase_path = tmp_path / "rephrase_manifest.json"
+    phrase_manifest = json.loads(phrase_path.read_text(encoding="utf-8"))
+    phrase_manifest["validation_language"] = "training_rephrase"
+    phrase_hash = write_canonical_json(phrase_path, phrase_manifest)
+    protocol_path = tmp_path / "run_protocol.json"
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    protocol["artifacts"]["rephrase_manifest"] = phrase_hash
+    protocol["identities"]["phrase_manifest_hash"] = phrase_hash
+    write_canonical_json(protocol_path, protocol)
+
+    with pytest.raises(ValueError, match="phrase"):
+        validate_protocol_directory(tmp_path, require_complete=False)
 
 
 def test_materialized_protocol_is_hashable_and_rejects_drift(tmp_path):
