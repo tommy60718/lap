@@ -11,6 +11,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from lap.verifiers.cover.bridge_audit import apply_audited_initialization
+from lap.verifiers.cover.checkpoint import build_checkpoint_contract
+from lap.verifiers.cover.checkpoint import build_four_state_inventory
+from lap.verifiers.cover.checkpoint import build_progress
+from lap.verifiers.cover.checkpoint import capture_rng_state
 from lap.verifiers.cover.checkpoint import publish_deployment_bundle
 from lap.verifiers.cover.checkpoint import save_training_checkpoint
 from lap.verifiers.cover.command import preflight_w3
@@ -116,8 +120,18 @@ def train_model(
         }
         history.append(epoch_record)
         if checkpoint_dir is not None and checkpoint_contract is not None:
-            progress = {"epoch": epoch + 1, "global_step": global_step}
-            sampler_state = {"epoch": epoch}
+            selection_loss = validation_loss if validation_loss is not None else epoch_record["loss"]
+            improved = selection_loss < best_validation_loss
+            if improved:
+                best_validation_loss = selection_loss
+            progress = build_progress(
+                epoch=epoch + 1,
+                global_step=global_step,
+                best_metric=best_validation_loss,
+                world_size=protocol.world_size,
+            )
+            sampler_state = {"epoch": epoch, "rank": 0, "world_size": protocol.world_size}
+            rng_states = {rank: capture_rng_state() for rank in range(protocol.world_size)}
             save_training_checkpoint(
                 Path(checkpoint_dir) / "latest.pt",
                 model=model,
@@ -126,10 +140,10 @@ def train_model(
                 progress=progress,
                 contract=checkpoint_contract,
                 sampler_state=sampler_state,
+                rank=0,
+                rng_states=rng_states,
             )
-            selection_loss = validation_loss if validation_loss is not None else epoch_record["loss"]
-            if selection_loss < best_validation_loss:
-                best_validation_loss = selection_loss
+            if improved:
                 save_training_checkpoint(
                     Path(checkpoint_dir) / "best.pt",
                     model=model,
@@ -138,10 +152,17 @@ def train_model(
                     progress=progress,
                     contract=checkpoint_contract,
                     sampler_state=sampler_state,
+                    rank=0,
+                    rng_states=rng_states,
                 )
     return {
         "history": history,
-        "progress": {"epoch": len(history), "global_step": global_step},
+        "progress": build_progress(
+            epoch=len(history),
+            global_step=global_step,
+            best_metric=best_validation_loss if best_validation_loss < float("inf") else float("nan"),
+            world_size=protocol.world_size,
+        ),
         "optimizer": optimizer,
         "scheduler": scheduler,
     }
@@ -263,13 +284,39 @@ def run_fixture_end_to_end(*, output_root: Path) -> dict[str, Any]:
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
-            progress={"epoch": 1},
-            contract={"protocol": protocol.to_dict(train_manifest_hash="fixture", phrase_manifest_hash="fixture")},
-            sampler_state={"epoch": 0},
+            progress=build_progress(epoch=1, global_step=1, best_metric=float(metrics["loss"]), world_size=1),
+            contract=build_checkpoint_contract(
+                audit_manifest_sha256="0" * 64,
+                bridge_artifact_sha256="0" * 64,
+                target_fingerprint="0" * 64,
+                protocol_content_hash="0" * 64,
+                protocol_version="w3-g02-accepted-run-v1",
+                model_config=model.config.to_dict(),
+                four_state_inventory=build_four_state_inventory(),
+                w2_identities={
+                    "train_manifest_hash": "fixture",
+                    "phrase_manifest_hash": "fixture",
+                    "normalization_artifact_hash": "fixture",
+                },
+                environment={"torch": torch.__version__, "fixture": True},
+            ),
+            sampler_state={"epoch": 0, "rank": 0, "world_size": 1},
+            rank=0,
         )
         metadata = {
             "deployable": True,
             "model_config": model.config.to_dict(),
+            "w3_01_initialization": {
+                "audit_manifest_sha256": "0" * 64,
+                "bridge_artifact_sha256": "0" * 64,
+                "target_fingerprint": "0" * 64,
+            },
+            "w3_03_protocol": {
+                "protocol_content_hash": "0" * 64,
+                "protocol_version": "w3-g02-accepted-run-v1",
+            },
+            "four_state_inventory": build_four_state_inventory(),
+            "package_scope": "test_scoped_fixture_not_canonical_w3_09",
             "scorer_compatibility": {
                 "model_schema_version": "osx_cover_verifier_checkpoint_v1",
                 "views": ["base_rgb", "wrist_rgb"],
@@ -356,14 +403,28 @@ def run_train_mode(
             device=device,
             validation_dataset=validation_dataset,
             checkpoint_dir=staging,
-            checkpoint_contract={
-                "protocol": protocol_payload,
-                "audit_manifest_sha256": audit["manifest_sha256"],
-                "model_config": model.config.to_dict(),
-                "backbone_revision": getattr(model.backbone, "backbone_revision", None),
-                "w2_validation_receipt": dataset.validation_receipt,
-                "views": ["base_rgb", "wrist_rgb"],
-            },
+            checkpoint_contract=build_checkpoint_contract(
+                audit_manifest_sha256=audit["manifest_sha256"],
+                bridge_artifact_sha256=audit["artifact"]["sha256"],
+                target_fingerprint=audit["target"]["fingerprint"],
+                protocol_content_hash=protocol_payload["content_hash"],
+                protocol_version=protocol_payload["protocol_version"],
+                model_config=model.config.to_dict(),
+                four_state_inventory=build_four_state_inventory(),
+                w2_identities={
+                    "train_manifest_hash": protocol_payload["identities"]["train_manifest_hash"],
+                    "phrase_manifest_hash": protocol_payload["identities"]["phrase_manifest_hash"],
+                    "normalization_artifact_hash": dataset.validation_receipt.get(
+                        "normalization_artifact_hash", dataset.validation_receipt.get("content_hash", "")
+                    ),
+                    "w2_validation_receipt": dataset.validation_receipt,
+                },
+                environment={
+                    "torch": torch.__version__,
+                    "backbone_revision": getattr(model.backbone, "backbone_revision", None),
+                    "views": ["base_rgb", "wrist_rgb"],
+                },
+            ),
         )
         train_receipt = {
             "schema": "osx_cover_w3_train_receipt_v1",
@@ -506,15 +567,29 @@ def run_canonical_acceptance(
         raise FileExistsError(staging)
     staging.mkdir(parents=True)
     validation_dataset = TwoViewDataset(dataset.validation, training=False, **dataset_kwargs)
-    checkpoint_contract = {
-        "protocol": protocol_payload,
-        "audit_manifest_sha256": audit["manifest_sha256"],
-        "model_config": model.config.to_dict(),
-        "backbone_revision": getattr(model.backbone, "backbone_revision", None),
-        "preprocessing_contract": "openclip_model_eval_transform_v1",
-        "w2_validation_receipt": dataset.validation_receipt,
-        "views": ["base_rgb", "wrist_rgb"],
-    }
+    checkpoint_contract = build_checkpoint_contract(
+        audit_manifest_sha256=audit["manifest_sha256"],
+        bridge_artifact_sha256=audit["artifact"]["sha256"],
+        target_fingerprint=audit["target"]["fingerprint"],
+        protocol_content_hash=protocol_payload["content_hash"],
+        protocol_version=protocol_payload["protocol_version"],
+        model_config=model.config.to_dict(),
+        four_state_inventory=build_four_state_inventory(),
+        w2_identities={
+            "train_manifest_hash": protocol_payload["identities"]["train_manifest_hash"],
+            "phrase_manifest_hash": protocol_payload["identities"]["phrase_manifest_hash"],
+            "normalization_artifact_hash": dataset.validation_receipt.get(
+                "normalization_artifact_hash", dataset.validation_receipt.get("content_hash", "")
+            ),
+            "w2_validation_receipt": dataset.validation_receipt,
+        },
+        environment={
+            "torch": torch.__version__,
+            "backbone_revision": getattr(model.backbone, "backbone_revision", None),
+            "preprocessing_contract": "openclip_model_eval_transform_v1",
+            "views": ["base_rgb", "wrist_rgb"],
+        },
+    )
     training = train_model(
         model,
         train_dataset,
@@ -563,13 +638,34 @@ def run_canonical_acceptance(
             optimizer=base_only["training"]["optimizer"],
             scheduler=base_only["training"]["scheduler"],
             progress=base_only["training"]["progress"],
-            contract={
-                "variant": "base_only",
-                "deployable": False,
-                "protocol": protocol_payload,
-                "audit_manifest_sha256": audit["manifest_sha256"],
+            contract=build_checkpoint_contract(
+                audit_manifest_sha256=audit["manifest_sha256"],
+                bridge_artifact_sha256=audit["artifact"]["sha256"],
+                target_fingerprint=audit["target"]["fingerprint"],
+                protocol_content_hash=protocol_payload["content_hash"],
+                protocol_version=protocol_payload["protocol_version"],
+                model_config=base_only["model"].config.to_dict(),
+                four_state_inventory=build_four_state_inventory(),
+                w2_identities={
+                    "train_manifest_hash": protocol_payload["identities"]["train_manifest_hash"],
+                    "phrase_manifest_hash": protocol_payload["identities"]["phrase_manifest_hash"],
+                    "normalization_artifact_hash": dataset.validation_receipt.get(
+                        "normalization_artifact_hash", dataset.validation_receipt.get("content_hash", "")
+                    ),
+                    "variant": "base_only",
+                    "deployable": False,
+                },
+                environment={"torch": torch.__version__, "variant": "base_only", "deployable": False},
+            ),
+            sampler_state={
+                "epoch": base_only["training"]["progress"]["epoch"],
+                "rank": 0,
+                "world_size": base_only["training"]["progress"]["world_size"],
             },
-            sampler_state={"epoch": base_only["training"]["progress"]["epoch"]},
+            rank=0,
+            rng_states={
+                rank: capture_rng_state() for rank in range(int(base_only["training"]["progress"]["world_size"]))
+            },
         )
         (staging / "base_only" / "metadata.json").write_bytes(
             canonical_bytes(
@@ -591,7 +687,17 @@ def run_canonical_acceptance(
             "tokenizer_id": "open_clip.get_tokenizer(hf-hub:timm/ViT-L-16-SigLIP2-384)",
             "evaluation_report": report,
             "base_only_ablation": ablation,
-            "audit_manifest_sha256": audit["manifest_sha256"],
+            "w3_01_initialization": {
+                "audit_manifest_sha256": audit["manifest_sha256"],
+                "bridge_artifact_sha256": audit["artifact"]["sha256"],
+                "target_fingerprint": audit["target"]["fingerprint"],
+            },
+            "w3_03_protocol": {
+                "protocol_content_hash": protocol_payload["content_hash"],
+                "protocol_version": protocol_payload["protocol_version"],
+            },
+            "four_state_inventory": build_four_state_inventory(),
+            "package_scope": "pipeline_acceptance_not_canonical_w3_09",
             "scorer_compatibility": {
                 "model_schema_version": "osx_cover_verifier_checkpoint_v1",
                 "views": ["base_rgb", "wrist_rgb"],
