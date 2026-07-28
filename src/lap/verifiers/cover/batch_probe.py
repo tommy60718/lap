@@ -18,11 +18,11 @@ from torch.nn.parallel import DistributedDataParallel
 from lap.verifiers.cover.bridge_audit import apply_audited_initialization
 from lap.verifiers.cover.data import TwoViewDataset
 from lap.verifiers.cover.data import W2DatasetGateway
+from lap.verifiers.cover.data import collate_two_view_batch
 from lap.verifiers.cover.data import make_sampler
 from lap.verifiers.cover.model import OpenClipSigLIP2Backbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
-from lap.verifiers.cover.pipeline import _collate
 from lap.verifiers.cover.protocol import PROBE_ORDER
 from lap.verifiers.cover.protocol import snapshot_nvidia_devices
 from lap.verifiers.cover.w3_contracts import BACKBONE_ID
@@ -116,9 +116,7 @@ def build_probe_receipt(
         "backbone": BACKBONE_ID,
         "backbone_revision": BACKBONE_REVISION,
         "configuration": selected_evidence.get("configuration", VerifierConfig().to_dict()),
-        "configuration_hash": selected_evidence.get(
-            "configuration_hash", content_hash(VerifierConfig().to_dict())
-        ),
+        "configuration_hash": selected_evidence.get("configuration_hash", content_hash(VerifierConfig().to_dict())),
         "audit_manifest_sha256": selected_evidence.get("audit_manifest_sha256", "0" * 64),
         "target_inventory_fingerprint": selected_evidence.get("target_inventory_fingerprint", "0" * 64),
         "two_view": True,
@@ -244,7 +242,7 @@ def run_probe_worker(
             train_dataset,
             batch_size=batch_size,
             sampler=sampler,
-            collate_fn=_collate,
+            collate_fn=collate_two_view_batch,
             num_workers=0,
         )
         batch = next(iter(loader))

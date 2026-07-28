@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from itertools import pairwise
 import json
 from pathlib import Path
 from typing import Any
@@ -17,6 +16,8 @@ from lap.verifiers.cover.checkpoint import save_training_checkpoint
 from lap.verifiers.cover.command import preflight_w3
 from lap.verifiers.cover.data import TwoViewDataset
 from lap.verifiers.cover.data import W2DatasetGateway
+from lap.verifiers.cover.data import build_epoch_collision_report
+from lap.verifiers.cover.data import collate_two_view_batch
 from lap.verifiers.cover.data import make_sampler
 from lap.verifiers.cover.evaluator import compare_ablation
 from lap.verifiers.cover.evaluator import evaluate_embeddings
@@ -35,18 +36,6 @@ from lap.verifiers.cover.w3_contracts import content_hash
 from lap.verifiers.cover.w3_contracts import sha256_file
 
 
-def _collate(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "sample_ids": [row["sample_id"] for row in rows],
-        "episode_ids": [row["episode_id"] for row in rows],
-        "base_rgb": torch.stack([row["base_rgb"] for row in rows]),
-        "wrist_rgb": torch.stack([row["wrist_rgb"] for row in rows]),
-        "instructions": [row["instruction"] for row in rows],
-        "action_histories": torch.stack([row["action_history"] for row in rows]),
-        "conditions": [row["condition"] for row in rows],
-    }
-
-
 def train_model(
     model: VerifierModel,
     dataset: TwoViewDataset,
@@ -61,7 +50,12 @@ def train_model(
     model.to(device)
     optimizer, scheduler = create_optimizer(model, protocol)
     sampler = make_sampler(dataset, seed=protocol.sampler_seed, world_size=protocol.world_size)
-    loader = DataLoader(dataset, batch_size=protocol.per_rank_batch_size, sampler=sampler, collate_fn=_collate)
+    loader = DataLoader(
+        dataset,
+        batch_size=protocol.per_rank_batch_size,
+        sampler=sampler,
+        collate_fn=collate_two_view_batch,
+    )
     history = []
     best_validation_loss = float("inf")
     global_step = 0
@@ -94,11 +88,6 @@ def train_model(
             epoch_metrics.append(train_one_batch(model, device_batch, optimizer))
             global_step += 1
         scheduler.step()
-        instructions = [row["instruction"] for row in epoch_rows]
-        sample_ids = [row["sample_id"] for row in epoch_rows]
-        episodes = [row["episode_id"] for row in epoch_rows]
-        histories = [row["history"] for row in epoch_rows]
-        pair_count = max(0, len(epoch_rows) - 1)
         validation_loss = None
         if validation_dataset is not None:
             model.eval()
@@ -106,7 +95,7 @@ def train_model(
                 validation_dataset,
                 batch_size=protocol.per_rank_batch_size,
                 shuffle=False,
-                collate_fn=_collate,
+                collate_fn=collate_two_view_batch,
             )
             validation_losses = []
             with torch.no_grad():
@@ -123,21 +112,7 @@ def train_model(
             "epoch": epoch,
             "loss": float(np.mean([item["loss"] for item in epoch_metrics])) if epoch_metrics else float("nan"),
             "validation_loss": validation_loss,
-            "sampler_diagnostics": {
-                "sampler_rows": len(sample_ids),
-                "sampler_added_duplicate_rows": max(0, len(sample_ids) - len(set(sample_ids))),
-                "repeated_instruction_pair_rate": float(1.0 - len(set(instructions)) / len(instructions))
-                if instructions
-                else 0.0,
-                "exact_duplicate_history_pair_rate": float(
-                    sum(np.array_equal(left, right) for left, right in pairwise(histories)) / pair_count
-                )
-                if pair_count
-                else 0.0,
-                "same_episode_pair_rate": float(sum(left == right for left, right in pairwise(episodes)) / pair_count)
-                if pair_count
-                else 0.0,
-            },
+            "sampler_diagnostics": build_epoch_collision_report(epoch_rows),
         }
         history.append(epoch_record)
         if checkpoint_dir is not None and checkpoint_contract is not None:
@@ -175,7 +150,7 @@ def train_model(
 def collect_embeddings(
     model: VerifierModel, dataset: TwoViewDataset, *, device: torch.device, batch_size: int
 ) -> dict[str, Any]:
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=_collate)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_two_view_batch)
     semantic = []
     action = []
     sample_ids = []

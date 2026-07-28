@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import importlib.util
 import json
@@ -156,6 +157,108 @@ class TwoViewDataset(Dataset[dict[str, Any]]):
             "action_history": torch.from_numpy(np.asarray(sample.action_history, dtype=np.float32).copy()),
             "condition": sample.condition,
         }
+
+
+def collate_two_view_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collate canonical W2 rows without changing either view or provenance."""
+
+    return {
+        "sample_ids": [row["sample_id"] for row in rows],
+        "episode_ids": [row["episode_id"] for row in rows],
+        "base_rgb": torch.stack([row["base_rgb"] for row in rows]),
+        "wrist_rgb": torch.stack([row["wrist_rgb"] for row in rows]),
+        "instructions": [row["instruction"] for row in rows],
+        "action_histories": torch.stack([row["action_history"] for row in rows]),
+        "conditions": [row["condition"] for row in rows],
+    }
+
+
+_DISTANCE_BIN_EDGES = np.asarray(
+    [0.0, 1e-6, 1e-4, 1e-3, 1e-2, 1e-1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, np.inf],
+    dtype=np.float64,
+)
+
+
+def _pair_metric(count: int, denominator: int) -> dict[str, int | float]:
+    return {
+        "count": count,
+        "denominator": denominator,
+        "rate": float(count / denominator) if denominator else 0.0,
+    }
+
+
+def _matching_pair_count(values: Sequence[Any]) -> int:
+    return sum(count * (count - 1) // 2 for count in Counter(values).values())
+
+
+def _distance_distribution(counts: np.ndarray, denominator: int) -> dict[str, Any]:
+    return {
+        "denominator": denominator,
+        "histogram_bin_edges": [*map(float, _DISTANCE_BIN_EDGES[:-1]), None],
+        "histogram_counts": [int(count) for count in counts],
+    }
+
+
+def build_epoch_collision_report(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Describe collisions over every unordered off-diagonal epoch-row pair."""
+
+    sample_ids = [str(row["sample_id"]) for row in rows]
+    episode_ids = [str(row["episode_id"]) for row in rows]
+    instructions = [str(row["instruction"]) for row in rows]
+    histories = np.stack(
+        [require_history(row["history"], name=f"epoch_rows[{index}].history") for index, row in enumerate(rows)]
+    )
+    row_count = len(rows)
+    pair_denominator = row_count * (row_count - 1) // 2
+    history_keys = [history.tobytes() for history in histories]
+    repeated_instruction_count = _matching_pair_count(instructions)
+    exact_history_count = _matching_pair_count(history_keys)
+    repeated_language_history_count = _matching_pair_count(list(zip(instructions, history_keys, strict=True)))
+    same_episode_count = _matching_pair_count(episode_ids)
+
+    all_histogram = np.zeros(len(_DISTANCE_BIN_EDGES) - 1, dtype=np.int64)
+    same_episode_histogram = np.zeros_like(all_histogram)
+    flattened = histories.astype(np.float64, copy=False).reshape(row_count, -1)
+    squared_norms = np.einsum("ij,ij->i", flattened, flattened)
+    block_size = 256
+    for start in range(0, row_count, block_size):
+        stop = min(start + block_size, row_count)
+        squared_distances = (
+            squared_norms[start:stop, None] + squared_norms[None, :] - 2.0 * flattened[start:stop] @ flattened.T
+        )
+        np.maximum(squared_distances, 0.0, out=squared_distances)
+        normalized_distances = np.sqrt(squared_distances / flattened.shape[1])
+        left_indices, right_indices = np.nonzero(np.arange(row_count)[None, :] > np.arange(start, stop)[:, None])
+        off_diagonal = normalized_distances[left_indices, right_indices]
+        all_histogram += np.histogram(off_diagonal, bins=_DISTANCE_BIN_EDGES)[0]
+        same_episode_mask = (
+            np.asarray(episode_ids, dtype=object)[right_indices]
+            == np.asarray(episode_ids[start:stop], dtype=object)[left_indices]
+        )
+        same_episode_histogram += np.histogram(off_diagonal[same_episode_mask], bins=_DISTANCE_BIN_EDGES)[0]
+
+    return {
+        "sampler_rows": row_count,
+        "unique_sampler_rows": len(set(sample_ids)),
+        "sampler_added_duplicate_rows": row_count - len(set(sample_ids)),
+        "off_diagonal_population": {
+            "pair_definition": "unordered_distinct_row_positions_i_lt_j",
+            "denominator": pair_denominator,
+        },
+        "repeated_instruction_pairs": _pair_metric(repeated_instruction_count, pair_denominator),
+        "exact_duplicate_history_pairs": _pair_metric(exact_history_count, pair_denominator),
+        "repeated_language_history_pairs": _pair_metric(repeated_language_history_count, pair_denominator),
+        "same_episode_pairs": _pair_metric(same_episode_count, pair_denominator),
+        "repeated_instruction_pair_rate": _pair_metric(repeated_instruction_count, pair_denominator)["rate"],
+        "exact_duplicate_history_pair_rate": _pair_metric(exact_history_count, pair_denominator)["rate"],
+        "same_episode_pair_rate": _pair_metric(same_episode_count, pair_denominator)["rate"],
+        "normalized_history_distances": {
+            "normalization": "root_mean_square_over_fixed_10x7_history",
+            "all_pairs": _distance_distribution(all_histogram, pair_denominator),
+            "same_episode_pairs": _distance_distribution(same_episode_histogram, same_episode_count),
+        },
+        "adapts_batches": False,
+    }
 
 
 def make_sampler(
