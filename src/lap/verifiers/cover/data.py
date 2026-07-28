@@ -17,6 +17,7 @@ from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from lap.verifiers.cover.protocol import select_training_phrase
+from lap.verifiers.cover.w3_contracts import HISTORY_SHAPE
 from lap.verifiers.cover.w3_contracts import W2_TRAIN_COUNT
 from lap.verifiers.cover.w3_contracts import W2_VALIDATION_COUNT
 from lap.verifiers.cover.w3_contracts import require_history
@@ -205,8 +206,11 @@ def build_epoch_collision_report(rows: Sequence[Mapping[str, Any]]) -> dict[str,
     sample_ids = [str(row["sample_id"]) for row in rows]
     episode_ids = [str(row["episode_id"]) for row in rows]
     instructions = [str(row["instruction"]) for row in rows]
-    histories = np.stack(
-        [require_history(row["history"], name=f"epoch_rows[{index}].history") for index, row in enumerate(rows)]
+    validated_histories = [
+        require_history(row["history"], name=f"epoch_rows[{index}].history") for index, row in enumerate(rows)
+    ]
+    histories = (
+        np.stack(validated_histories) if validated_histories else np.empty((0, *HISTORY_SHAPE), dtype=np.float32)
     )
     row_count = len(rows)
     pair_denominator = row_count * (row_count - 1) // 2
@@ -218,7 +222,7 @@ def build_epoch_collision_report(rows: Sequence[Mapping[str, Any]]) -> dict[str,
 
     all_histogram = np.zeros(len(_DISTANCE_BIN_EDGES) - 1, dtype=np.int64)
     same_episode_histogram = np.zeros_like(all_histogram)
-    flattened = histories.astype(np.float64, copy=False).reshape(row_count, -1)
+    flattened = histories.astype(np.float64, copy=False).reshape(row_count, HISTORY_SHAPE[0] * HISTORY_SHAPE[1])
     squared_norms = np.einsum("ij,ij->i", flattened, flattened)
     block_size = 256
     for start in range(0, row_count, block_size):

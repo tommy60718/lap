@@ -101,6 +101,24 @@ def test_single_row_collision_report_has_explicit_zero_denominators():
     assert report["normalized_history_distances"]["all_pairs"]["denominator"] == 0
 
 
+def test_empty_collision_report_has_explicit_zero_population():
+    report = build_epoch_collision_report([])
+
+    assert report["sampler_rows"] == 0
+    assert report["unique_sampler_rows"] == 0
+    assert report["sampler_added_duplicate_rows"] == 0
+    assert report["off_diagonal_population"]["denominator"] == 0
+    assert report["repeated_instruction_pairs"] == {"count": 0, "denominator": 0, "rate": 0.0}
+    assert report["exact_duplicate_history_pairs"] == {"count": 0, "denominator": 0, "rate": 0.0}
+    assert report["repeated_language_history_pairs"] == {"count": 0, "denominator": 0, "rate": 0.0}
+    assert report["same_episode_pairs"] == {"count": 0, "denominator": 0, "rate": 0.0}
+    assert report["normalized_history_distances"]["all_pairs"]["denominator"] == 0
+    assert report["normalized_history_distances"]["all_pairs"]["histogram_counts"] == [0] * 12
+    assert report["normalized_history_distances"]["same_episode_pairs"]["denominator"] == 0
+    assert report["normalized_history_distances"]["same_episode_pairs"]["histogram_counts"] == [0] * 12
+    assert report["adapts_batches"] is False
+
+
 def test_sampler_is_seeded_distributed_sampler_with_epoch_order(tmp_path):
     gateway = W2DatasetGateway(_fixture_export(tmp_path), fixture=True)
     dataset = TwoViewDataset(gateway.train)
