@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from lap.verifiers.cover.batch_probe import build_probe_receipt
 from lap.verifiers.cover.batch_probe import compare_memory_to_baseline
 from lap.verifiers.cover.bridge_audit import build_production_target_inventory
 from lap.verifiers.cover.model import VerifierConfig
+from lap.verifiers.cover.model import fingerprint_siglip2_assets
 from lap.verifiers.cover.protocol import validate_batch_probe_receipt
+from lap.verifiers.cover.w3_contracts import BACKBONE_ID
+from lap.verifiers.cover.w3_contracts import BACKBONE_REVISION
 from lap.verifiers.cover.w3_contracts import content_hash
 
 
@@ -55,6 +61,25 @@ def _rank_success(rank: int, *, batch_size: int = 64, gradient_fingerprint: str 
     }
 
 
+def _asset_evidence(tmp_path: Path):
+    snapshot = tmp_path / BACKBONE_REVISION
+    snapshot.mkdir()
+    (snapshot / "open_clip_config.json").write_text(
+        json.dumps({"preprocess_cfg": {"mean": [0.5]}, "model_cfg": {"text_cfg": {"context_length": 64}}}),
+        encoding="utf-8",
+    )
+    for filename in ("special_tokens_map.json", "tokenizer.json", "tokenizer_config.json"):
+        (snapshot / filename).write_text(json.dumps({"source": filename}), encoding="utf-8")
+    return {
+        "siglip2_snapshot": {
+            "backbone_id": BACKBONE_ID,
+            "revision": BACKBONE_REVISION,
+            "local_snapshot": str(snapshot),
+        },
+        **fingerprint_siglip2_assets(snapshot),
+    }
+
+
 def test_memory_drift_distinguishes_stable_and_transient_fields():
     report = compare_memory_to_baseline(_snapshot())
 
@@ -65,8 +90,9 @@ def test_memory_drift_distinguishes_stable_and_transient_fields():
     assert "transient" in report["explanation"]
 
 
-def test_probe_receipt_records_canonical_two_rank_success():
+def test_probe_receipt_records_canonical_two_rank_success(tmp_path):
     configuration = VerifierConfig().to_dict()
+    asset_evidence = _asset_evidence(tmp_path)
     receipt = build_probe_receipt(
         snapshot=_snapshot(),
         attempts=[
@@ -79,12 +105,11 @@ def test_probe_receipt_records_canonical_two_rank_success():
         selected_batch_size=64,
         memory_drift=compare_memory_to_baseline(_snapshot()),
         evidence={
+            **asset_evidence,
             "configuration": configuration,
             "configuration_hash": content_hash(configuration),
             "audit_manifest_sha256": "1" * 64,
             "target_inventory_fingerprint": build_production_target_inventory().fingerprint,
-            "preprocessing_fingerprint": "2" * 64,
-            "tokenizer_fingerprint": "3" * 64,
         },
     )
 
@@ -92,8 +117,8 @@ def test_probe_receipt_records_canonical_two_rank_success():
     assert receipt["selected_per_rank_batch_size"] == 64
     assert receipt["successful_two_rank_optimizer_step"] == {"batch_size": 64, "ranks": [0, 1]}
     assert receipt["model"]["backbone_revision"]
-    assert receipt["model"]["preprocessing_fingerprint"] == "2" * 64
-    assert receipt["model"]["tokenizer_fingerprint"] == "3" * 64
+    assert receipt["model"]["preprocessing_fingerprint"] == asset_evidence["preprocessing_fingerprint"]
+    assert receipt["model"]["tokenizer_fingerprint"] == asset_evidence["tokenizer_fingerprint"]
     assert receipt["model"]["negative_pool"] == "rank_local"
     assert receipt["memory_drift"]["baseline_date"] == "2026-07-23"
 
@@ -135,7 +160,7 @@ def test_probe_receipt_rejects_rank_without_full_optimizer_evidence():
         )
 
 
-def test_receipt_validation_rejects_rehashed_invalid_rank_records():
+def test_receipt_validation_rejects_rehashed_invalid_rank_records(tmp_path):
     receipt = build_probe_receipt(
         snapshot=_snapshot(),
         attempts=[
@@ -148,6 +173,7 @@ def test_receipt_validation_rejects_rehashed_invalid_rank_records():
         selected_batch_size=64,
         memory_drift=compare_memory_to_baseline(_snapshot()),
         evidence={
+            **_asset_evidence(tmp_path),
             "configuration": VerifierConfig().to_dict(),
             "configuration_hash": content_hash(VerifierConfig().to_dict()),
             "audit_manifest_sha256": "1" * 64,
@@ -162,7 +188,7 @@ def test_receipt_validation_rejects_rehashed_invalid_rank_records():
         validate_batch_probe_receipt(receipt)
 
 
-def test_canonical_receipt_requires_per_rank_batch_64():
+def test_canonical_receipt_requires_per_rank_batch_64(tmp_path):
     receipt = build_probe_receipt(
         snapshot=_snapshot(),
         attempts=[
@@ -175,6 +201,7 @@ def test_canonical_receipt_requires_per_rank_batch_64():
         selected_batch_size=32,
         memory_drift=compare_memory_to_baseline(_snapshot()),
         evidence={
+            **_asset_evidence(tmp_path),
             "configuration": VerifierConfig().to_dict(),
             "configuration_hash": content_hash(VerifierConfig().to_dict()),
             "audit_manifest_sha256": "1" * 64,

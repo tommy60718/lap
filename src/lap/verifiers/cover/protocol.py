@@ -602,6 +602,7 @@ def validate_batch_probe_receipt(
     if require_canonical:
         from lap.verifiers.cover.bridge_audit import build_production_target_inventory  # noqa: PLC0415
         from lap.verifiers.cover.model import VerifierConfig  # noqa: PLC0415
+        from lap.verifiers.cover.model import fingerprint_siglip2_assets  # noqa: PLC0415
 
         expected_configuration = VerifierConfig().to_dict()
         if model_identity.get("configuration") != expected_configuration:
@@ -611,6 +612,14 @@ def validate_batch_probe_receipt(
         current_fingerprint = build_production_target_inventory().fingerprint
         if model_identity.get("target_inventory_fingerprint") != current_fingerprint:
             raise ValueError("batch receipt target inventory fingerprint differs from the canonical verifier")
+        snapshot = payload["environment"]["siglip2_snapshot"]
+        local_snapshot = snapshot.get("local_snapshot")
+        if local_snapshot is None:
+            raise ValueError("canonical batch receipt is missing the pinned local SigLIP2 snapshot")
+        expected_assets = fingerprint_siglip2_assets(Path(str(local_snapshot)))
+        for field, expected in expected_assets.items():
+            if model_identity.get(field) != expected:
+                raise ValueError(f"batch receipt {field.replace('_', ' ')} differs from the pinned snapshot")
         if (
             expected_target_inventory_fingerprint is not None
             and model_identity.get("target_inventory_fingerprint") != expected_target_inventory_fingerprint

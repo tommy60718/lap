@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
+import sys
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from lap.verifiers.cover.model import OpenClipSigLIP2Backbone
 from lap.verifiers.cover.model import TextAwareVisualExtraction
 from lap.verifiers.cover.model import TinyFrozenBackbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
+from lap.verifiers.cover.w3_contracts import BACKBONE_REVISION
 
 
 def _model(*, use_wrist=True):
@@ -67,6 +73,42 @@ def test_verifier_config_fingerprint_includes_semantic_behavior_contracts():
     assert config["trajectory_activation"] == "relu"
     assert config["trajectory_position_contract"] == "sinusoidal_v1"
     assert config["attention_pooling_contract"] == "lap_fresh_attention_pool_v1"
+
+
+def test_openclip_backbone_loads_preprocessing_and_tokenizer_from_one_pinned_snapshot(tmp_path, monkeypatch):
+    snapshot = tmp_path / BACKBONE_REVISION
+    snapshot.mkdir()
+    (snapshot / "open_clip_config.json").write_text(
+        json.dumps({"preprocess_cfg": {"mean": [0.5]}, "model_cfg": {"text_cfg": {"context_length": 64}}}),
+        encoding="utf-8",
+    )
+    for filename in ("special_tokens_map.json", "tokenizer.json", "tokenizer_config.json"):
+        (snapshot / filename).write_text(json.dumps({"source": filename}), encoding="utf-8")
+    calls = []
+    frozen_model = torch.nn.Linear(1, 1)
+
+    def create_model_and_transforms(model_name, *, pretrained):
+        calls.append(("preprocess", model_name))
+        return frozen_model, None, "pinned-preprocess"
+
+    def get_tokenizer(model_name):
+        calls.append(("tokenizer", model_name))
+        return SimpleNamespace()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "open_clip",
+        SimpleNamespace(create_model_and_transforms=create_model_and_transforms, get_tokenizer=get_tokenizer),
+    )
+    model_name = f"local-dir:{snapshot}"
+
+    backbone = OpenClipSigLIP2Backbone(model_name=model_name)
+
+    assert calls == [("preprocess", model_name), ("tokenizer", model_name)]
+    assert backbone.asset_fingerprints == {
+        "preprocessing_fingerprint": "67c8af8a0d007115bf310b8443924703884c93abbe38bf55e3555e40d26768f3",
+        "tokenizer_fingerprint": "73a4aeff34b428112bcadf6e490f211110d12c6dcdb4115d3151b2b7f1381d40",
+    }
 
 
 def test_model_rejects_unimplemented_semantic_contract():

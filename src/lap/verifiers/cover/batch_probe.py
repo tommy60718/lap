@@ -373,6 +373,8 @@ def run_probe_worker(
             model_dir=model_dir,
         )
         backbone.model.to(dtype=torch.bfloat16)
+        if backbone.asset_fingerprints is None:
+            raise ValueError("W3 canonical probe did not load pinned preprocessing and tokenizer assets")
         frozen_before = _parameter_fingerprint(model, trainable=False)
         trainable_before = _parameter_fingerprint(model, trainable=True)
         train_dataset = TwoViewDataset(dataset.train, seed=42, training=True, preprocess=backbone.preprocess)
@@ -458,17 +460,7 @@ def run_probe_worker(
                 "frozen_backbone_dtype": frozen_dtypes.pop(),
                 "trainable_dtype": trainable_dtypes.pop(),
                 "logits_dtype": str(output["semantic_to_action_logits"].dtype).removeprefix("torch."),
-                "preprocessing_fingerprint": hashlib.sha256(repr(backbone.preprocess).encode()).hexdigest(),
-                "tokenizer_fingerprint": content_hash(
-                    {
-                        "loader": "open_clip",
-                        "backbone": BACKBONE_ID,
-                        "revision": BACKBONE_REVISION,
-                        "tokenizer_class": (
-                            f"{backbone.tokenizer.__class__.__module__}.{backbone.tokenizer.__class__.__qualname__}"
-                        ),
-                    }
-                ),
+                **backbone.asset_fingerprints,
                 "max_memory_allocated_mib": round(torch.cuda.max_memory_allocated(device) / (1024**2), 2),
                 "max_memory_reserved_mib": round(torch.cuda.max_memory_reserved(device) / (1024**2), 2),
                 "free_memory_after_mib": round(free_bytes / (1024**2), 2),

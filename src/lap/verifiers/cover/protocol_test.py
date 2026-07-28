@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 
 import numpy as np
 import pytest
@@ -9,6 +10,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from lap.verifiers.cover.bridge_audit import build_production_target_inventory
 from lap.verifiers.cover.model import VerifierConfig
+from lap.verifiers.cover.model import fingerprint_siglip2_assets
 from lap.verifiers.cover.protocol import APPROVED_SHUFFLED_EXCLUSIONS
 from lap.verifiers.cover.protocol import EVALUATION_SEED
 from lap.verifiers.cover.protocol import PROBE_ORDER
@@ -24,20 +26,23 @@ from lap.verifiers.cover.protocol import sampler_indices
 from lap.verifiers.cover.protocol import select_training_phrase
 from lap.verifiers.cover.protocol import validate_batch_probe_receipt
 from lap.verifiers.cover.protocol import validate_protocol_directory
+from lap.verifiers.cover.w3_contracts import BACKBONE_ID
+from lap.verifiers.cover.w3_contracts import BACKBONE_REVISION
 from lap.verifiers.cover.w3_contracts import content_hash
 from lap.verifiers.cover.w3_contracts import sha256_file
 from lap.verifiers.cover.w3_contracts import write_canonical_json
 
 CANONICAL_EXPORT = Path(__file__).resolve().parents[6] / ".w2_canonical_export_v3"
+CANONICAL_RECEIPT = Path(__file__).resolve().parents[4] / "artifacts/w3/protocol/batch_probe_receipt.json"
 
 
 def _canonical_validation_rows():
     return json.loads((CANONICAL_EXPORT / "validation_samples.json").read_text(encoding="utf-8"))
 
 
-def _canonical_model_identity(*, audit_manifest_sha256: str = "1" * 64):
+def _canonical_model_identity(*, audit_manifest_sha256: str = "1" * 64, snapshot: Path | None = None):
     configuration = VerifierConfig().to_dict()
-    return {
+    identity = {
         "backbone": "hf-hub:timm/ViT-L-16-SigLIP2-384",
         "canonical_target": True,
         "configuration": configuration,
@@ -47,6 +52,26 @@ def _canonical_model_identity(*, audit_manifest_sha256: str = "1" * 64):
         "preprocessing_fingerprint": "2" * 64,
         "tokenizer_fingerprint": "3" * 64,
     }
+    if snapshot is not None:
+        identity.update(fingerprint_siglip2_assets(snapshot))
+        identity["siglip2_snapshot"] = {
+            "backbone_id": BACKBONE_ID,
+            "revision": BACKBONE_REVISION,
+            "local_snapshot": str(snapshot),
+        }
+    return identity
+
+
+def _asset_snapshot(tmp_path: Path):
+    snapshot = tmp_path / BACKBONE_REVISION
+    snapshot.mkdir()
+    (snapshot / "open_clip_config.json").write_text(
+        json.dumps({"preprocess_cfg": {"mean": [0.5]}, "model_cfg": {"text_cfg": {"context_length": 64}}}),
+        encoding="utf-8",
+    )
+    for filename in ("special_tokens_map.json", "tokenizer.json", "tokenizer_config.json"):
+        (snapshot / filename).write_text(json.dumps({"source": filename}), encoding="utf-8")
+    return snapshot
 
 
 def _canonical_gpu_snapshots():
@@ -438,10 +463,11 @@ def test_protocol_core_rejects_rehashed_phrase_contract_drift(tmp_path):
 
 
 def test_materialized_protocol_is_hashable_and_rejects_drift(tmp_path):
+    snapshot = _asset_snapshot(tmp_path)
     receipt = probe_batch_sizes(
         _rank_success,
         snapshot_fn=_canonical_gpu_snapshots,
-        model_identity=_canonical_model_identity(),
+        model_identity=_canonical_model_identity(snapshot=snapshot),
     )
     materialize_protocol(
         tmp_path,
@@ -477,11 +503,29 @@ def test_canonical_batch_receipt_rejects_rehashed_identity_drift():
         validate_batch_probe_receipt(receipt, require_canonical=True)
 
 
-def test_canonical_batch_receipt_must_match_supplied_audit():
+@pytest.mark.parametrize("field", ["tokenizer_fingerprint", "preprocessing_fingerprint"])
+def test_canonical_batch_receipt_rejects_rehashed_runtime_asset_drift(field):
+    receipt = json.loads(CANONICAL_RECEIPT.read_text(encoding="utf-8"))
+    receipt["environment"]["lap_revision"] = subprocess.check_output(
+        ["git", "-C", str(Path(__file__).resolve().parents[4]), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    receipt["model"]["preprocessing_fingerprint"] = "fd7ffb201d3e3eec5770fa313d96af1c031403cab51ae43ee734ed1d431c3b14"
+    receipt["model"]["tokenizer_fingerprint"] = "e97a61cde12740e6031fa02bcd4aa39d9b0e75f1b8fe6c1ef9dad92bc4b09575"
+    receipt["model"][field] = "0" * 64
+    unsigned = {key: value for key, value in receipt.items() if key != "content_hash"}
+    receipt["content_hash"] = content_hash(unsigned)
+
+    with pytest.raises(ValueError, match=field.replace("_", " ")):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
+
+
+def test_canonical_batch_receipt_must_match_supplied_audit(tmp_path):
+    snapshot = _asset_snapshot(tmp_path)
     receipt = probe_batch_sizes(
         _rank_success,
         snapshot_fn=_canonical_gpu_snapshots,
-        model_identity=_canonical_model_identity(audit_manifest_sha256="a" * 64),
+        model_identity=_canonical_model_identity(audit_manifest_sha256="a" * 64, snapshot=snapshot),
     )
 
     with pytest.raises(ValueError, match="audit manifest"):

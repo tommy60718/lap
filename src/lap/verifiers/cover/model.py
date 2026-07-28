@@ -6,7 +6,9 @@ from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 import hashlib
+import json
 import math
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -16,6 +18,52 @@ from torch.nn import functional as F  # noqa: N812
 from lap.verifiers.cover.w3_contracts import BACKBONE_ID
 from lap.verifiers.cover.w3_contracts import BACKBONE_REVISION
 from lap.verifiers.cover.w3_contracts import HISTORY_SHAPE
+from lap.verifiers.cover.w3_contracts import content_hash
+from lap.verifiers.cover.w3_contracts import sha256_file
+
+_TOKENIZER_ASSET_FILES = (
+    "open_clip_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
+
+
+def fingerprint_siglip2_assets(snapshot_dir: Path) -> dict[str, str]:
+    """Fingerprint the pinned snapshot content that defines preprocessing and tokenization."""
+
+    snapshot = Path(snapshot_dir).resolve()
+    if snapshot.name != BACKBONE_REVISION:
+        raise ValueError("SigLIP2 asset snapshot does not match the pinned revision")
+    config_path = snapshot / "open_clip_config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        preprocess_config = config["preprocess_cfg"]
+        text_config = config["model_cfg"]["text_cfg"]
+    except (OSError, KeyError, json.JSONDecodeError, TypeError) as error:
+        raise ValueError("pinned SigLIP2 snapshot has invalid OpenCLIP asset configuration") from error
+    tokenizer_files = {}
+    for filename in _TOKENIZER_ASSET_FILES:
+        path = snapshot / filename
+        if not path.is_file():
+            raise ValueError(f"pinned SigLIP2 snapshot is missing tokenizer asset {filename}")
+        tokenizer_files[filename] = sha256_file(path)
+    return {
+        "preprocessing_fingerprint": content_hash(
+            {
+                "revision": BACKBONE_REVISION,
+                "preprocess_cfg": preprocess_config,
+                "open_clip_config_sha256": sha256_file(config_path),
+            }
+        ),
+        "tokenizer_fingerprint": content_hash(
+            {
+                "revision": BACKBONE_REVISION,
+                "text_cfg": text_config,
+                "files": tokenizer_files,
+            }
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -326,9 +374,12 @@ class OpenClipSigLIP2Backbone(nn.Module):
         self.model = model.eval()
         self.preprocess = preprocess
         self.backbone_revision = BACKBONE_REVISION
+        self.asset_fingerprints = None
+        if model_name.startswith("local-dir:"):
+            self.asset_fingerprints = fingerprint_siglip2_assets(Path(model_name.removeprefix("local-dir:")))
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)  # noqa: FBT003
-        self.tokenizer = open_clip.get_tokenizer(BACKBONE_ID)
+        self.tokenizer = open_clip.get_tokenizer(model_name)
 
     def encode_image_tokens(self, images: torch.Tensor) -> torch.Tensor:
         visual = self.model.visual
