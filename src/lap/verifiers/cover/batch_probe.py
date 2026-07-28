@@ -299,7 +299,7 @@ def _tensor_fingerprint(named_tensors: Sequence[tuple[str, torch.Tensor]]) -> st
         value = tensor.detach().contiguous().cpu()
         digest.update(str(value.dtype).encode("ascii"))
         digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(value.view(torch.uint8).numpy().tobytes())
+        digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 
