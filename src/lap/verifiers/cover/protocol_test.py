@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from torch.utils.data.distributed import DistributedSampler
 
+from lap.verifiers.cover import protocol as protocol_module
 from lap.verifiers.cover.bridge_audit import build_production_target_inventory
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import fingerprint_siglip2_assets
@@ -119,12 +120,74 @@ def _rank_success(batch_size: int, rank: int, _gpu):
     }
 
 
-def test_revision_drift_classification_ignores_only_non_runtime_w3_paths():
+def test_revision_drift_classification_limits_capacity_defining_paths():
     assert not _is_runtime_relevant_path("AGENTS.md")
     assert not _is_runtime_relevant_path("artifacts/w3/protocol/run_protocol.json")
     assert not _is_runtime_relevant_path(".understand-anything/graph.json")
+    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/checkpoint.py")
+    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/checkpoint_test.py")
+    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/pipeline.py")
+    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/command.py")
+    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/evaluator.py")
+    assert not _is_runtime_relevant_path("scripts/w3_cover.py")
+    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/protocol.py")
     assert _is_runtime_relevant_path("src/lap/verifiers/cover/model.py")
+    assert _is_runtime_relevant_path("src/lap/verifiers/cover/training.py")
+    assert _is_runtime_relevant_path("src/lap/verifiers/cover/batch_probe.py")
+    assert _is_runtime_relevant_path("src/lap/verifiers/cover/data.py")
+    assert _is_runtime_relevant_path("src/lap/verifiers/cover/bridge_audit.py")
+    assert _is_runtime_relevant_path("src/lap/verifiers/cover/w3_contracts.py")
+    assert _is_runtime_relevant_path("scripts/w3_batch_probe.py")
+    assert _is_runtime_relevant_path("pyproject.toml")
     assert _is_runtime_relevant_path("uv.lock")
+
+
+def test_canonical_receipt_allows_unrelated_downstream_commits(monkeypatch):
+    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(protocol_module, "_current_lap_revision", lambda: "b" * 40)
+
+    def fake_run(args, **kwargs):
+        if "merge-base" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    def fake_check_output(args, **kwargs):
+        if "diff" in args and "--name-only" in args:
+            return "\n".join(
+                [
+                    "artifacts/w3/protocol/batch_probe_receipt.json",
+                    "src/lap/verifiers/cover/checkpoint.py",
+                    "src/lap/verifiers/cover/checkpoint_test.py",
+                    "src/lap/verifiers/cover/pipeline.py",
+                ]
+            )
+        if "status" in args:
+            return ""
+        raise AssertionError(args)
+
+    monkeypatch.setattr(protocol_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(protocol_module.subprocess, "check_output", fake_check_output)
+    validate_batch_probe_receipt(receipt, require_canonical=True)
+
+
+def test_canonical_receipt_rejects_capacity_defining_drift(monkeypatch):
+    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(protocol_module, "_current_lap_revision", lambda: "b" * 40)
+
+    def fake_run(args, **kwargs):
+        if "merge-base" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    def fake_check_output(args, **kwargs):
+        if "diff" in args and "--name-only" in args:
+            return "src/lap/verifiers/cover/model.py\n"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(protocol_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(protocol_module.subprocess, "check_output", fake_check_output)
+    with pytest.raises(ValueError, match="relevant code or environment drift"):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
 
 
 def test_phrase_manifest_has_exact_approved_bank():

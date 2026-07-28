@@ -471,8 +471,32 @@ def _current_lap_revision() -> str:
     ).strip()
 
 
+_CAPACITY_DEFINING_PATHS = frozenset(
+    {
+        "pyproject.toml",
+        "uv.lock",
+        "scripts/w3_batch_probe.py",
+        "src/lap/verifiers/cover/batch_probe.py",
+        "src/lap/verifiers/cover/bridge_audit.py",
+        "src/lap/verifiers/cover/data.py",
+        "src/lap/verifiers/cover/model.py",
+        "src/lap/verifiers/cover/training.py",
+        "src/lap/verifiers/cover/w3_contracts.py",
+    }
+)
+
+
 def _is_runtime_relevant_path(path: str) -> bool:
-    return path != "AGENTS.md" and not path.startswith(("artifacts/w3/", ".understand-anything/"))
+    """Return whether a path can invalidate immutable capacity evidence.
+
+    Downstream orchestration, checkpoint, evaluator, CLI, and protocol-validator
+    policy changes must not force a new GPU probe. Capacity-defining
+    model/training/probe/data/audit/contract modules and environment lockfiles
+    still fail closed. Protocol and receipt *identities* continue to fail closed
+    through content validation, not through this path check.
+    """
+    normalized = path.replace("\\", "/").lstrip("./")
+    return normalized in _CAPACITY_DEFINING_PATHS
 
 
 def _validate_lap_revision(recorded_revision: str) -> None:
