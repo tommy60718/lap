@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import copy
 from dataclasses import dataclass
 from dataclasses import field
 import json
@@ -42,6 +43,13 @@ REQUIRED_TRAINING_PAYLOAD_KEYS = (
     "contract",
     "rng_states",
     "sampler_state",
+)
+REQUIRED_DEPLOYMENT_INDEX_FILES = frozenset(
+    {
+        "model.pt",
+        "metadata.json",
+        ACCEPTED_DEPLOYMENT_MARKER,
+    }
 )
 
 
@@ -342,6 +350,7 @@ def _validate_training_payload(
         raise ValueError("incomplete checkpoint missing optimizer_state")
     if "scheduler_state" not in payload:
         raise ValueError("incomplete checkpoint missing scheduler_state")
+    sampler_state = _require_mapping(payload["sampler_state"], name="sampler_state")
     expected_keys = set(model.state_dict())
     actual_keys = set(_require_mapping(payload["model_state"], name="model_state"))
     if actual_keys != expected_keys:
@@ -353,11 +362,42 @@ def _validate_training_payload(
         "progress": progress,
         "contract": contract,
         "rng_states": rng_states,
-        "sampler_state": dict(payload["sampler_state"]),
+        "sampler_state": dict(sampler_state),
         "model_state": payload["model_state"],
         "optimizer_state": payload["optimizer_state"],
         "scheduler_state": payload["scheduler_state"],
     }
+
+
+def _dry_run_state_restore(
+    *,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    model_state: Mapping[str, torch.Tensor],
+    optimizer_state: Mapping[str, Any],
+    scheduler_state: Any,
+) -> None:
+    """Prove restore compatibility without mutating caller-owned objects."""
+
+    try:
+        probe_model = copy.deepcopy(model)
+        probe_model.load_state_dict(model_state, strict=True)
+    except Exception as error:
+        raise ValueError("checkpoint model state is incompatible") from error
+    try:
+        probe_optimizer = copy.deepcopy(optimizer)
+        probe_optimizer.load_state_dict(optimizer_state)
+    except Exception as error:
+        raise ValueError("checkpoint optimizer state is incompatible") from error
+    if scheduler is not None:
+        if scheduler_state is None:
+            raise ValueError("checkpoint scheduler_state is missing")
+        try:
+            probe_scheduler = copy.deepcopy(scheduler)
+            probe_scheduler.load_state_dict(scheduler_state)
+        except Exception as error:
+            raise ValueError("checkpoint scheduler state is incompatible") from error
 
 
 def load_training_checkpoint(
@@ -376,11 +416,17 @@ def load_training_checkpoint(
         model=model,
         rank=rank,
     )
+    _dry_run_state_restore(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        model_state=validated["model_state"],
+        optimizer_state=validated["optimizer_state"],
+        scheduler_state=validated["scheduler_state"],
+    )
     model.load_state_dict(validated["model_state"], strict=True)
     optimizer.load_state_dict(validated["optimizer_state"])
     if scheduler is not None:
-        if validated["scheduler_state"] is None:
-            raise ValueError("checkpoint scheduler_state is missing")
         scheduler.load_state_dict(validated["scheduler_state"])
     restore_rng_state(validated["rng_states"][int(rank)])
     return {
@@ -481,6 +527,26 @@ def _scorer_compatibility_from_metadata(payload: Mapping[str, Any]) -> ScorerCom
     )
 
 
+def _validate_deployment_content_index(root: Path, index: Mapping[str, Any]) -> None:
+    files = _require_mapping(index.get("files"), name="content_index.files")
+    indexed = set(files)
+    missing = REQUIRED_DEPLOYMENT_INDEX_FILES - indexed
+    if missing:
+        raise ValueError(f"deployment content index incomplete; missing required files: {sorted(missing)}")
+    unexpected = indexed - REQUIRED_DEPLOYMENT_INDEX_FILES
+    if unexpected:
+        raise ValueError(f"deployment content index contains unexpected files: {sorted(unexpected)}")
+    on_disk = {path.name for path in root.iterdir() if path.is_file()}
+    expected_on_disk = indexed | {"content_index.json"}
+    if on_disk != expected_on_disk:
+        raise ValueError("deployment content index does not match bundle files")
+    for name, expected in files.items():
+        if not (root / name).is_file():
+            raise ValueError(f"deployment content index missing file on disk: {name}")
+        if sha256_file(root / name) != expected:
+            raise ValueError(f"deployment content hash mismatch: {name}")
+
+
 def load_deployment_bundle(
     root: Path,
     *,
@@ -508,9 +574,7 @@ def load_deployment_bundle(
     index = json.loads((root / "content_index.json").read_text(encoding="utf-8"))
     if index.get("content_hash") != content_hash(index):
         raise ValueError("deployment content index hash mismatch")
-    for name, expected in index.get("files", {}).items():
-        if sha256_file(root / name) != expected:
-            raise ValueError(f"deployment content hash mismatch: {name}")
+    _validate_deployment_content_index(root, index)
 
     payload = _load_payload(root / "model.pt")
     if payload.get("schema") != W3_DEPLOYMENT_SCHEMA:

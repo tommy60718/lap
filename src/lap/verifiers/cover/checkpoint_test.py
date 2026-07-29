@@ -23,6 +23,9 @@ from lap.verifiers.cover.data import preprocess_rgb
 from lap.verifiers.cover.model import TinyFrozenBackbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
+from lap.verifiers.cover.w3_contracts import canonical_bytes
+from lap.verifiers.cover.w3_contracts import content_hash
+from lap.verifiers.cover.w3_contracts import sha256_file
 
 
 def _model():
@@ -340,3 +343,107 @@ def test_load_deployment_bundle_score_requires_accepted_marker_and_validates_bef
 def test_nondeployable_bundle_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="nondeployable"):
         publish_deployment_bundle(tmp_path / "deployment", model=_model(), metadata={"deployable": False})
+
+
+def test_invalid_optimizer_state_rejects_without_mutating_caller_owned_state(tmp_path):
+    """W3-06-R1: incompatible optimizer/scheduler/RNG must fail closed before mutation."""
+
+    source = _model()
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    loss = sum(parameter.sum() for parameter in source.parameters())
+    loss.backward()
+    optimizer.step()
+    contract = _contract()
+    path = tmp_path / "latest.pt"
+    save_training_checkpoint(
+        path,
+        model=source,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=_progress(),
+        contract=contract,
+        sampler_state={"epoch": 1, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["optimizer_state"] = {"invalid": True}
+    torch.save(payload, path)
+
+    target = _model()
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=1)
+    pristine_model = {name: tensor.detach().cpu().clone() for name, tensor in target.state_dict().items()}
+    pristine_optimizer = copy.deepcopy(target_optimizer.state_dict())
+    pristine_scheduler = copy.deepcopy(target_scheduler.state_dict())
+    torch.manual_seed(123)
+    np.random.seed(123)
+    pristine_torch_rng = torch.get_rng_state().clone()
+    pristine_numpy_rng = np.random.get_state()
+
+    with pytest.raises(ValueError, match=r"optimizer|incompatible"):
+        load_training_checkpoint(
+            path,
+            model=target,
+            optimizer=target_optimizer,
+            scheduler=target_scheduler,
+            expected_contract=contract,
+            rank=0,
+        )
+
+    for name, tensor in target.state_dict().items():
+        torch.testing.assert_close(tensor.cpu(), pristine_model[name], atol=0.0, rtol=0.0)
+    assert target_optimizer.state_dict() == pristine_optimizer
+    assert target_scheduler.state_dict() == pristine_scheduler
+    assert torch.equal(torch.get_rng_state(), pristine_torch_rng)
+    assert np.random.get_state()[1].tolist() == list(pristine_numpy_rng[1])
+
+
+def test_coherently_rehashed_incomplete_or_extra_content_index_is_rejected(tmp_path):
+    """W3-06-R2: complete content-index membership is required before model construction."""
+
+    normalization_hash = "1" * 64
+    constructed: list[str] = []
+
+    def tracking_factory():
+        constructed.append("built")
+        return _model()
+
+    root = tmp_path / "deployment"
+    publish_deployment_bundle(root, model=_model(), metadata=_scorer_metadata(), accepted_marker=True)
+
+    omitted = tmp_path / "omitted"
+    omitted.mkdir()
+    for path in root.iterdir():
+        (omitted / path.name).write_bytes(path.read_bytes())
+    index = json.loads((omitted / "content_index.json").read_text(encoding="utf-8"))
+    del index["files"]["model.pt"]
+    index["content_hash"] = content_hash(index)
+    (omitted / "content_index.json").write_bytes(canonical_bytes(index) + b"\n")
+    with pytest.raises(ValueError, match=r"content index|required|incomplete|model\.pt"):
+        load_deployment_bundle(
+            omitted,
+            model_factory=tracking_factory,
+            expected_normalization_hash=normalization_hash,
+            preprocessing=preprocess_rgb,
+        )
+    assert constructed == []
+
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    for path in root.iterdir():
+        (extra / path.name).write_bytes(path.read_bytes())
+    (extra / "unexpected.bin").write_bytes(b"extra")
+    index = json.loads((extra / "content_index.json").read_text(encoding="utf-8"))
+    index["files"]["unexpected.bin"] = sha256_file(extra / "unexpected.bin")
+    index["content_hash"] = content_hash(index)
+    (extra / "content_index.json").write_bytes(canonical_bytes(index) + b"\n")
+    # Extra indexed file beyond the required sealed set must also fail closed.
+    with pytest.raises(ValueError, match=r"content index|unexpected|extra|required"):
+        load_deployment_bundle(
+            extra,
+            model_factory=tracking_factory,
+            expected_normalization_hash=normalization_hash,
+            preprocessing=preprocess_rgb,
+        )
+    assert constructed == []
