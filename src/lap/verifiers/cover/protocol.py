@@ -7,6 +7,7 @@ injectable two-rank forward/backward probe of the pinned two-view model.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -471,59 +472,146 @@ def _current_lap_revision() -> str:
     ).strip()
 
 
+_BRIDGE_AUDIT_PATH = "src/lap/verifiers/cover/bridge_audit.py"
 _CAPACITY_DEFINING_PATHS = frozenset(
     {
         "pyproject.toml",
         "uv.lock",
         "scripts/w3_batch_probe.py",
         "src/lap/verifiers/cover/batch_probe.py",
-        "src/lap/verifiers/cover/bridge_audit.py",
         "src/lap/verifiers/cover/data.py",
         "src/lap/verifiers/cover/model.py",
         "src/lap/verifiers/cover/training.py",
         "src/lap/verifiers/cover/w3_contracts.py",
     }
 )
+_BRIDGE_AUDIT_CAPACITY_SYMBOLS = frozenset(
+    {
+        "APPROVED_SOURCE_INDEX",
+        "AUDIT_SCHEMA",
+        "BRIDGE_ARTIFACT_FORMAT",
+        "CANONICAL_TARGET_KIND",
+        "DEFAULT_SIGLIP2_SNAPSHOT_PROVENANCE",
+        "EXPECTED_BRIDGE_SHA256",
+        "EXPECTED_BRIDGE_SIZE",
+        "REJECTED_SOURCE_REASONS",
+        "SEMANTICALLY_INCOMPATIBLE_PREFIXES",
+        "TRANSFERRED_PREFIXES",
+        "TargetInventory",
+        "TargetTensor",
+        "apply_audited_initialization",
+        "audit_bridge_checkpoint",
+        "build_production_target_inventory",
+    }
+)
+
+
+def _normalize_repo_path(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
 
 
 def _is_runtime_relevant_path(path: str) -> bool:
-    """Return whether a path can invalidate immutable capacity evidence.
+    """Return whether a path hard-fails immutable capacity evidence.
 
-    Downstream orchestration, checkpoint, evaluator, CLI, and protocol-validator
-    policy changes must not force a new GPU probe. Capacity-defining
-    model/training/probe/data/audit/contract modules and environment lockfiles
-    still fail closed. Protocol and receipt *identities* continue to fail closed
-    through content validation, not through this path check.
+    Downstream orchestration, checkpoint, evaluator, CLI, protocol-validator
+    policy, and identity-preserving `bridge_audit` loader ownership moves must
+    not force a new GPU probe. Capacity-defining model/training/probe/data/
+    contract modules and environment lockfiles still fail closed. Audit
+    producer surfaces in `bridge_audit.py` are checked by symbol continuity,
+    while audit/target/initialization *identities* fail closed through content
+    validation.
     """
-    normalized = path.replace("\\", "/").lstrip("./")
-    return normalized in _CAPACITY_DEFINING_PATHS
+    return _normalize_repo_path(path) in _CAPACITY_DEFINING_PATHS
+
+
+def _extract_named_sources(source: str, names: frozenset[str]) -> dict[str, str]:
+    tree = ast.parse(source)
+    extracted: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names:
+            segment = ast.get_source_segment(source, node)
+            if segment is not None:
+                extracted[node.name] = segment
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in names:
+                    segment = ast.get_source_segment(source, node)
+                    if segment is not None:
+                        extracted[target.id] = segment
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id in names:
+            segment = ast.get_source_segment(source, node)
+            if segment is not None:
+                extracted[node.target.id] = segment
+    return extracted
+
+
+def _read_bridge_audit_source(*, revision: str | None = None, worktree: bool = False) -> str:
+    root = _project_root()
+    if worktree:
+        return (root / _BRIDGE_AUDIT_PATH).read_text(encoding="utf-8")
+    if revision is None:
+        raise ValueError("bridge audit source revision is required unless reading the worktree")
+    return subprocess.check_output(
+        ["git", "-C", str(root), "show", f"{revision}:{_BRIDGE_AUDIT_PATH}"],
+        text=True,
+    )
+
+
+def _bridge_audit_capacity_symbols_changed(*, baseline_revision: str, worktree: bool) -> bool:
+    baseline = _extract_named_sources(
+        _read_bridge_audit_source(revision=baseline_revision),
+        _BRIDGE_AUDIT_CAPACITY_SYMBOLS,
+    )
+    current = _extract_named_sources(
+        _read_bridge_audit_source(worktree=worktree)
+        if worktree
+        else _read_bridge_audit_source(revision=_current_lap_revision()),
+        _BRIDGE_AUDIT_CAPACITY_SYMBOLS,
+    )
+    return baseline != current
+
+
+def _path_invalidates_capacity(path: str, *, baseline_revision: str, worktree: bool) -> bool:
+    normalized = _normalize_repo_path(path)
+    if normalized == _BRIDGE_AUDIT_PATH:
+        return _bridge_audit_capacity_symbols_changed(
+            baseline_revision=baseline_revision,
+            worktree=worktree,
+        )
+    return _is_runtime_relevant_path(normalized)
 
 
 def _validate_lap_revision(recorded_revision: str) -> None:
     current_revision = _current_lap_revision()
-    if recorded_revision == current_revision:
-        return
+    root = _project_root()
     try:
-        subprocess.run(
-            ["git", "-C", str(_project_root()), "merge-base", "--is-ancestor", recorded_revision, current_revision],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        changed = subprocess.check_output(
-            ["git", "-C", str(_project_root()), "diff", "--name-only", f"{recorded_revision}..{current_revision}"],
+        if recorded_revision != current_revision:
+            subprocess.run(
+                ["git", "-C", str(root), "merge-base", "--is-ancestor", recorded_revision, current_revision],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            changed = subprocess.check_output(
+                ["git", "-C", str(root), "diff", "--name-only", f"{recorded_revision}..{current_revision}"],
+                text=True,
+            ).splitlines()
+            if any(
+                _path_invalidates_capacity(path, baseline_revision=recorded_revision, worktree=False)
+                for path in changed
+            ):
+                raise ValueError("batch receipt LAP revision has relevant code or environment drift")
+        dirty_paths = subprocess.check_output(
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
             text=True,
         ).splitlines()
+        if any(
+            _path_invalidates_capacity(line[3:], baseline_revision=current_revision, worktree=True)
+            for line in dirty_paths
+        ):
+            raise ValueError("current LAP checkout has uncommitted runtime-relevant changes")
     except (OSError, subprocess.CalledProcessError) as error:
         raise ValueError("batch receipt LAP revision is not an ancestor of the current checkout") from error
-    if any(_is_runtime_relevant_path(path) for path in changed):
-        raise ValueError("batch receipt LAP revision has relevant code or environment drift")
-    dirty_paths = subprocess.check_output(
-        ["git", "-C", str(_project_root()), "status", "--porcelain", "--untracked-files=all"],
-        text=True,
-    ).splitlines()
-    if any(_is_runtime_relevant_path(line[3:]) for line in dirty_paths):
-        raise ValueError("current LAP checkout has uncommitted runtime-relevant changes")
 
 
 def _validate_environment(environment: Mapping[str, Any]) -> None:

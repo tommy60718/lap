@@ -131,15 +131,75 @@ def test_revision_drift_classification_limits_capacity_defining_paths():
     assert not _is_runtime_relevant_path("src/lap/verifiers/cover/evaluator.py")
     assert not _is_runtime_relevant_path("scripts/w3_cover.py")
     assert not _is_runtime_relevant_path("src/lap/verifiers/cover/protocol.py")
+    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/bridge_audit.py")
     assert _is_runtime_relevant_path("src/lap/verifiers/cover/model.py")
     assert _is_runtime_relevant_path("src/lap/verifiers/cover/training.py")
     assert _is_runtime_relevant_path("src/lap/verifiers/cover/batch_probe.py")
     assert _is_runtime_relevant_path("src/lap/verifiers/cover/data.py")
-    assert _is_runtime_relevant_path("src/lap/verifiers/cover/bridge_audit.py")
     assert _is_runtime_relevant_path("src/lap/verifiers/cover/w3_contracts.py")
     assert _is_runtime_relevant_path("scripts/w3_batch_probe.py")
     assert _is_runtime_relevant_path("pyproject.toml")
     assert _is_runtime_relevant_path("uv.lock")
+
+
+def test_accepted_receipt_allows_w3_02_audit_loader_ownership_move():
+    """Live public-seam proof: dirty W3-02 bridge_audit loader move must not invalidate."""
+    audit = json.loads(Path("artifacts/w3/bridge_audit_manifest.json").read_text(encoding="utf-8"))
+    dirty = subprocess.check_output(
+        ["git", "status", "--porcelain", "--", "src/lap/verifiers/cover/bridge_audit.py"], text=True
+    )
+    assert dirty.strip(), "expected preserved W3-02 bridge_audit ownership move in the worktree"
+    bridge_diff = subprocess.check_output(
+        ["git", "diff", "--", "src/lap/verifiers/cover/bridge_audit.py"],
+        text=True,
+    )
+    assert "def load_and_validate_audit_manifest" in bridge_diff
+    validated = validate_protocol_directory(
+        Path("artifacts/w3/protocol"),
+        require_complete=True,
+        expected_audit_manifest_sha256=audit["manifest_sha256"],
+        expected_target_inventory_fingerprint=audit["target"]["fingerprint"],
+    )
+    assert validated["batch_probe_receipt"]["content_hash"] == (
+        "57878ecccba5e657eb8ccc3526693b4c2769e2e6c3da4bab412e148f7632d7a4"
+    )
+
+
+def test_canonical_receipt_rejects_bridge_audit_producer_symbol_drift(monkeypatch):
+    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    committed = subprocess.check_output(
+        ["git", "show", "HEAD:src/lap/verifiers/cover/bridge_audit.py"],
+        text=True,
+    )
+    mutated = committed.replace(
+        "def apply_audited_initialization(",
+        "def apply_audited_initialization(  # capacity-defining drift\n",
+        1,
+    )
+    assert mutated != committed
+    monkeypatch.setattr(protocol_module, "_current_lap_revision", lambda: "b" * 40)
+
+    def fake_run(args, **kwargs):
+        if "merge-base" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    def fake_check_output(args, **kwargs):
+        if "diff" in args and "--name-only" in args:
+            return ""
+        if "status" in args:
+            return " M src/lap/verifiers/cover/bridge_audit.py\n"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(protocol_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(protocol_module.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(
+        protocol_module,
+        "_read_bridge_audit_source",
+        lambda **kwargs: mutated if kwargs.get("worktree") else committed,
+    )
+    with pytest.raises(ValueError, match="uncommitted runtime-relevant changes"):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
 
 
 def test_canonical_receipt_allows_unrelated_downstream_commits(monkeypatch):
