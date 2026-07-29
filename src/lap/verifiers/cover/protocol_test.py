@@ -17,7 +17,6 @@ from lap.verifiers.cover.protocol import EVALUATION_SEED
 from lap.verifiers.cover.protocol import PROBE_ORDER
 from lap.verifiers.cover.protocol import TRAINING_SEED
 from lap.verifiers.cover.protocol import WORLD_SIZE
-from lap.verifiers.cover.protocol import _is_runtime_relevant_path
 from lap.verifiers.cover.protocol import build_bootstrap_indices
 from lap.verifiers.cover.protocol import build_phrase_manifest
 from lap.verifiers.cover.protocol import build_shuffled_pairs
@@ -120,26 +119,10 @@ def _rank_success(batch_size: int, rank: int, _gpu):
     }
 
 
-def test_revision_drift_classification_limits_capacity_defining_paths():
-    assert not _is_runtime_relevant_path("AGENTS.md")
-    assert not _is_runtime_relevant_path("artifacts/w3/protocol/run_protocol.json")
-    assert not _is_runtime_relevant_path(".understand-anything/graph.json")
-    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/checkpoint.py")
-    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/checkpoint_test.py")
-    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/pipeline.py")
-    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/command.py")
-    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/evaluator.py")
-    assert not _is_runtime_relevant_path("scripts/w3_cover.py")
-    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/protocol.py")
-    assert not _is_runtime_relevant_path("src/lap/verifiers/cover/bridge_audit.py")
-    assert _is_runtime_relevant_path("src/lap/verifiers/cover/model.py")
-    assert _is_runtime_relevant_path("src/lap/verifiers/cover/training.py")
-    assert _is_runtime_relevant_path("src/lap/verifiers/cover/batch_probe.py")
-    assert _is_runtime_relevant_path("src/lap/verifiers/cover/data.py")
-    assert _is_runtime_relevant_path("src/lap/verifiers/cover/w3_contracts.py")
-    assert _is_runtime_relevant_path("scripts/w3_batch_probe.py")
-    assert _is_runtime_relevant_path("pyproject.toml")
-    assert _is_runtime_relevant_path("uv.lock")
+def _rehash_receipt(receipt: dict) -> dict:
+    unsigned = {key: value for key, value in receipt.items() if key != "content_hash"}
+    receipt["content_hash"] = content_hash(unsigned)
+    return receipt
 
 
 def test_accepted_receipt_allows_w3_02_audit_loader_ownership_move():
@@ -165,86 +148,8 @@ def test_accepted_receipt_allows_w3_02_audit_loader_ownership_move():
     )
 
 
-def test_canonical_receipt_rejects_bridge_audit_transitive_helper_drift(monkeypatch):
-    """Public-seam reproduction of residual R6: private helper drift must fail closed."""
-    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
-    committed = subprocess.check_output(
-        ["git", "show", "HEAD:src/lap/verifiers/cover/bridge_audit.py"],
-        text=True,
-    )
-    mutated = committed.replace(
-        "def _inventory_matches_model(model: nn.Module, inventory: TargetInventory) -> None:\n"
-        "    model_inventory = _target_inventory_from_model(model)\n"
-        "    if model_inventory.fingerprint != inventory.fingerprint:\n"
-        '        raise ValueError("model target inventory does not match audit target inventory fingerprint")\n',
-        "def _inventory_matches_model(model: nn.Module, inventory: TargetInventory) -> None:\n    return None\n",
-        1,
-    )
-    assert mutated != committed
-    assert "def apply_audited_initialization(" in mutated
-    monkeypatch.setattr(protocol_module, "_current_lap_revision", lambda: "b" * 40)
-
-    def fake_run(args, **kwargs):
-        if "merge-base" in args:
-            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-        raise AssertionError(args)
-
-    def fake_check_output(args, **kwargs):
-        if "diff" in args and "--name-only" in args:
-            return ""
-        if "status" in args:
-            return " M src/lap/verifiers/cover/bridge_audit.py\n"
-        raise AssertionError(args)
-
-    monkeypatch.setattr(protocol_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(protocol_module.subprocess, "check_output", fake_check_output)
-    monkeypatch.setattr(
-        protocol_module,
-        "_read_bridge_audit_source",
-        lambda **kwargs: mutated if kwargs.get("worktree") else committed,
-    )
-    with pytest.raises(ValueError, match="uncommitted runtime-relevant changes"):
-        validate_batch_probe_receipt(receipt, require_canonical=True)
-
-
-def test_canonical_receipt_rejects_bridge_audit_producer_symbol_drift(monkeypatch):
-    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
-    committed = subprocess.check_output(
-        ["git", "show", "HEAD:src/lap/verifiers/cover/bridge_audit.py"],
-        text=True,
-    )
-    mutated = committed.replace(
-        "def apply_audited_initialization(",
-        "def apply_audited_initialization(  # capacity-defining drift\n",
-        1,
-    )
-    assert mutated != committed
-    monkeypatch.setattr(protocol_module, "_current_lap_revision", lambda: "b" * 40)
-
-    def fake_run(args, **kwargs):
-        if "merge-base" in args:
-            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-        raise AssertionError(args)
-
-    def fake_check_output(args, **kwargs):
-        if "diff" in args and "--name-only" in args:
-            return ""
-        if "status" in args:
-            return " M src/lap/verifiers/cover/bridge_audit.py\n"
-        raise AssertionError(args)
-
-    monkeypatch.setattr(protocol_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(protocol_module.subprocess, "check_output", fake_check_output)
-    monkeypatch.setattr(
-        protocol_module,
-        "_read_bridge_audit_source",
-        lambda **kwargs: mutated if kwargs.get("worktree") else committed,
-    )
-    with pytest.raises(ValueError, match="uncommitted runtime-relevant changes"):
-        validate_batch_probe_receipt(receipt, require_canonical=True)
-
-
-def test_canonical_receipt_allows_unrelated_downstream_commits(monkeypatch):
+def test_canonical_receipt_allows_later_source_only_checkout(monkeypatch):
+    """R6: later source edits alone must not invalidate an unchanged historical receipt."""
     receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
     monkeypatch.setattr(protocol_module, "_current_lap_revision", lambda: "b" * 40)
 
@@ -257,14 +162,24 @@ def test_canonical_receipt_allows_unrelated_downstream_commits(monkeypatch):
         if "diff" in args and "--name-only" in args:
             return "\n".join(
                 [
-                    "artifacts/w3/protocol/batch_probe_receipt.json",
+                    "src/lap/verifiers/cover/model.py",
+                    "src/lap/verifiers/cover/training.py",
+                    "src/lap/verifiers/cover/bridge_audit.py",
+                    "src/lap/verifiers/cover/batch_probe.py",
                     "src/lap/verifiers/cover/checkpoint.py",
-                    "src/lap/verifiers/cover/checkpoint_test.py",
+                    "src/lap/verifiers/cover/command.py",
                     "src/lap/verifiers/cover/pipeline.py",
+                    "scripts/w3_cover.py",
+                    "pyproject.toml",
+                    "uv.lock",
                 ]
             )
         if "status" in args:
-            return ""
+            return (
+                " M src/lap/verifiers/cover/bridge_audit.py\n"
+                " M src/lap/verifiers/cover/model.py\n"
+                " M src/lap/verifiers/cover/command.py\n"
+            )
         raise AssertionError(args)
 
     monkeypatch.setattr(protocol_module.subprocess, "run", fake_run)
@@ -272,23 +187,73 @@ def test_canonical_receipt_allows_unrelated_downstream_commits(monkeypatch):
     validate_batch_probe_receipt(receipt, require_canonical=True)
 
 
-def test_canonical_receipt_rejects_capacity_defining_drift(monkeypatch):
+def test_canonical_receipt_rejects_fabricated_lap_revision():
     receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    receipt["environment"]["lap_revision"] = "not-a-git-revision"
+    _rehash_receipt(receipt)
+    with pytest.raises(ValueError, match="invalid LAP revision"):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
+
+
+def test_canonical_receipt_rejects_unrelated_lap_revision(monkeypatch):
+    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    receipt["environment"]["lap_revision"] = "a" * 40
+    _rehash_receipt(receipt)
     monkeypatch.setattr(protocol_module, "_current_lap_revision", lambda: "b" * 40)
 
     def fake_run(args, **kwargs):
         if "merge-base" in args:
-            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-        raise AssertionError(args)
-
-    def fake_check_output(args, **kwargs):
-        if "diff" in args and "--name-only" in args:
-            return "src/lap/verifiers/cover/model.py\n"
+            raise subprocess.CalledProcessError(1, args, output="", stderr="not an ancestor")
         raise AssertionError(args)
 
     monkeypatch.setattr(protocol_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(protocol_module.subprocess, "check_output", fake_check_output)
-    with pytest.raises(ValueError, match="relevant code or environment drift"):
+    with pytest.raises(ValueError, match="not an ancestor"):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
+
+
+def test_canonical_receipt_rejects_rehashed_model_configuration_drift():
+    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    receipt["environment"]["lap_revision"] = subprocess.check_output(
+        ["git", "-C", str(Path(__file__).resolve().parents[4]), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    receipt["model"]["configuration"] = dict(receipt["model"]["configuration"])
+    receipt["model"]["configuration"]["embedding_width"] = int(receipt["model"]["configuration"]["embedding_width"]) + 1
+    receipt["model"]["configuration_hash"] = content_hash(receipt["model"]["configuration"])
+    _rehash_receipt(receipt)
+    with pytest.raises(ValueError, match="model configuration"):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
+
+
+def test_canonical_receipt_rejects_rehashed_target_inventory_drift():
+    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    receipt["environment"]["lap_revision"] = subprocess.check_output(
+        ["git", "-C", str(Path(__file__).resolve().parents[4]), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    receipt["model"]["target_inventory_fingerprint"] = "0" * 64
+    _rehash_receipt(receipt)
+    with pytest.raises(ValueError, match="target inventory fingerprint"):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
+
+
+def test_canonical_receipt_rejects_rehashed_content_hash_tamper():
+    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    receipt["content_hash"] = "0" * 64
+    with pytest.raises(ValueError, match="content hash mismatch"):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
+
+
+def test_canonical_receipt_rejects_noncanonical_selected_batch():
+    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    receipt["environment"]["lap_revision"] = subprocess.check_output(
+        ["git", "-C", str(Path(__file__).resolve().parents[4]), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    receipt["selected_per_rank_batch_size"] = 32
+    receipt["successful_two_rank_optimizer_step"] = {"batch_size": 32, "ranks": [0, 1]}
+    _rehash_receipt(receipt)
+    with pytest.raises(ValueError, match="per-rank batch size 64"):
         validate_batch_probe_receipt(receipt, require_canonical=True)
 
 

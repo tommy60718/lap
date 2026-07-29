@@ -7,7 +7,6 @@ injectable two-rank forward/backward probe of the pinned two-view model.
 
 from __future__ import annotations
 
-import ast
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -472,134 +471,25 @@ def _current_lap_revision() -> str:
     ).strip()
 
 
-_BRIDGE_AUDIT_PATH = "src/lap/verifiers/cover/bridge_audit.py"
-_CAPACITY_DEFINING_PATHS = frozenset(
-    {
-        "pyproject.toml",
-        "uv.lock",
-        "scripts/w3_batch_probe.py",
-        "src/lap/verifiers/cover/batch_probe.py",
-        "src/lap/verifiers/cover/data.py",
-        "src/lap/verifiers/cover/model.py",
-        "src/lap/verifiers/cover/training.py",
-        "src/lap/verifiers/cover/w3_contracts.py",
-    }
-)
-# Identity-preserving W3-02 ownership move only. Everything else in
-# bridge_audit.py—including private transitive helpers—is capacity-binding.
-_BRIDGE_AUDIT_LOADER_ONLY_SYMBOLS = frozenset(
-    {
-        "_require_mapping",
-        "_validate_audit_manifest_structure",
-        "load_and_validate_audit_manifest",
-    }
-)
-
-
-def _normalize_repo_path(path: str) -> str:
-    return path.replace("\\", "/").lstrip("./")
-
-
-def _is_runtime_relevant_path(path: str) -> bool:
-    """Return whether a path hard-fails immutable capacity evidence.
-
-    Downstream orchestration, checkpoint, evaluator, CLI, protocol-validator
-    policy, and the W3-02 audit-loader ownership move must not force a new GPU
-    probe. Capacity-defining model/training/probe/data/contract modules and
-    environment lockfiles still fail closed. For `bridge_audit.py`, every
-    top-level definition except the loader-only ownership surface is compared,
-    so private transitive initialization helpers fail closed without a manual
-    producer-symbol list.
-    """
-    return _normalize_repo_path(path) in _CAPACITY_DEFINING_PATHS
-
-
-def _top_level_definition_name(node: ast.AST) -> str | None:
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return node.name
-    if isinstance(node, ast.Assign):
-        names = [target.id for target in node.targets if isinstance(target, ast.Name)]
-        return names[0] if len(names) == 1 else None
-    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-        return node.target.id
-    return None
-
-
-def _extract_capacity_binding_sources(source: str) -> dict[str, str]:
-    """Return top-level bridge_audit definitions excluding the loader-only move."""
-    tree = ast.parse(source)
-    extracted: dict[str, str] = {}
-    for node in tree.body:
-        name = _top_level_definition_name(node)
-        if name is None or name in _BRIDGE_AUDIT_LOADER_ONLY_SYMBOLS:
-            continue
-        segment = ast.get_source_segment(source, node)
-        if segment is not None:
-            extracted[name] = segment
-    return extracted
-
-
-def _read_bridge_audit_source(*, revision: str | None = None, worktree: bool = False) -> str:
-    root = _project_root()
-    if worktree:
-        return (root / _BRIDGE_AUDIT_PATH).read_text(encoding="utf-8")
-    if revision is None:
-        raise ValueError("bridge audit source revision is required unless reading the worktree")
-    return subprocess.check_output(
-        ["git", "-C", str(root), "show", f"{revision}:{_BRIDGE_AUDIT_PATH}"],
-        text=True,
-    )
-
-
-def _bridge_audit_capacity_surface_changed(*, baseline_revision: str, worktree: bool) -> bool:
-    baseline = _extract_capacity_binding_sources(_read_bridge_audit_source(revision=baseline_revision))
-    current_source = (
-        _read_bridge_audit_source(worktree=True)
-        if worktree
-        else _read_bridge_audit_source(revision=_current_lap_revision())
-    )
-    return baseline != _extract_capacity_binding_sources(current_source)
-
-
-def _path_invalidates_capacity(path: str, *, baseline_revision: str, worktree: bool) -> bool:
-    normalized = _normalize_repo_path(path)
-    if normalized == _BRIDGE_AUDIT_PATH:
-        return _bridge_audit_capacity_surface_changed(
-            baseline_revision=baseline_revision,
-            worktree=worktree,
-        )
-    return _is_runtime_relevant_path(normalized)
-
-
 def _validate_lap_revision(recorded_revision: str) -> None:
+    """Require a well-formed historical LAP revision that ancestors the checkout.
+
+    The capacity receipt attests the recorded historical execution. Compatibility
+    with the current checkout is decided by serialized identities and required
+    tests elsewhere—not by Git path diffs, source allowlists, or AST extraction.
+    """
+
     current_revision = _current_lap_revision()
+    if recorded_revision == current_revision:
+        return
     root = _project_root()
     try:
-        if recorded_revision != current_revision:
-            subprocess.run(
-                ["git", "-C", str(root), "merge-base", "--is-ancestor", recorded_revision, current_revision],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            changed = subprocess.check_output(
-                ["git", "-C", str(root), "diff", "--name-only", f"{recorded_revision}..{current_revision}"],
-                text=True,
-            ).splitlines()
-            if any(
-                _path_invalidates_capacity(path, baseline_revision=recorded_revision, worktree=False)
-                for path in changed
-            ):
-                raise ValueError("batch receipt LAP revision has relevant code or environment drift")
-        dirty_paths = subprocess.check_output(
-            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+        subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", recorded_revision, current_revision],
+            check=True,
+            capture_output=True,
             text=True,
-        ).splitlines()
-        if any(
-            _path_invalidates_capacity(line[3:], baseline_revision=current_revision, worktree=True)
-            for line in dirty_paths
-        ):
-            raise ValueError("current LAP checkout has uncommitted runtime-relevant changes")
+        )
     except (OSError, subprocess.CalledProcessError) as error:
         raise ValueError("batch receipt LAP revision is not an ancestor of the current checkout") from error
 
