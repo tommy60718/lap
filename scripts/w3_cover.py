@@ -38,9 +38,11 @@ def parser() -> argparse.ArgumentParser:
 
 
 def dispatch(args: argparse.Namespace) -> dict:
-    if args.mode == "fixture-acceptance" or (args.mode in {"train", "evaluate", "package", "accept"} and args.fixture):
-        if args.mode in {"fixture-acceptance", "accept"}:
-            return run_fixture_end_to_end(output_root=args.output_root)
+    if args.mode == "fixture-acceptance":
+        return run_fixture_end_to_end(output_root=args.output_root)
+    if args.fixture and args.mode in {"train", "evaluate", "package", "accept"}:
+        if args.mode == "accept":
+            raise ValueError("accept mode does not alias fixture execution; use --mode fixture-acceptance")
         raise ValueError("fixture train/evaluate/package modes require their explicit stage inputs")
     if args.mode == "preflight":
         return preflight_w3(

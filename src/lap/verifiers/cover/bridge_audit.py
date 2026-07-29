@@ -447,6 +447,172 @@ def _manifest_hash(manifest: Mapping[str, Any]) -> str:
     return actual
 
 
+def _require_mapping(value: Any, *, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"initialization audit manifest {name} must be an object")
+    return value
+
+
+def _validate_audit_manifest_structure(manifest: Mapping[str, Any]) -> None:
+    required = {"schema", "artifact", "policy", "target", "entries", "manifest_sha256"}
+    optional: set[str] = set()
+    keys = set(manifest)
+    missing = required - keys
+    unexpected = keys - required - optional
+    if missing:
+        raise ValueError(f"initialization audit manifest missing fields: {sorted(missing)}")
+    if unexpected:
+        raise ValueError(f"initialization audit manifest has unexpected fields: {sorted(unexpected)}")
+    if manifest.get("schema") != AUDIT_SCHEMA:
+        raise ValueError("initialization audit manifest schema is unsupported")
+
+    policy = _require_mapping(manifest["policy"], name="policy")
+    if policy.get("approved_source_index") != 0 or policy.get("weights_only_loader") is not True:
+        raise ValueError("initialization audit manifest policy is invalid")
+    if not isinstance(policy.get("transferred_prefixes"), list) or not policy["transferred_prefixes"]:
+        raise ValueError("initialization audit manifest policy is missing transfer allowlist")
+
+    artifact = _require_mapping(manifest["artifact"], name="artifact")
+    artifact_required = {
+        "filename",
+        "size",
+        "sha256",
+        "format",
+        "source_index",
+        "repository",
+        "retrieval_method",
+        "license_provenance",
+    }
+    missing_artifact = artifact_required - set(artifact)
+    if missing_artifact:
+        raise ValueError(f"initialization audit manifest artifact missing fields: {sorted(missing_artifact)}")
+    if not isinstance(artifact["size"], int) or artifact["size"] <= 0:
+        raise ValueError("initialization audit manifest artifact size is invalid")
+    if not isinstance(artifact["sha256"], str) or len(artifact["sha256"]) != 64:
+        raise ValueError("initialization audit manifest artifact sha256 is invalid")
+    if not isinstance(artifact["source_index"], int):
+        raise ValueError("initialization audit manifest artifact source_index is invalid")
+
+    target = _require_mapping(manifest["target"], name="target")
+    target_required = {"config", "fingerprint", "inventory_kind", "key_count", "keys", "siglip2_snapshot"}
+    missing_target = target_required - set(target)
+    if missing_target:
+        raise ValueError(f"initialization audit manifest target missing fields: {sorted(missing_target)}")
+    fingerprint = target["fingerprint"]
+    target_key_specs = target["keys"]
+    if target.get("inventory_kind") != CANONICAL_TARGET_KIND:
+        raise ValueError("initialization audit manifest target is not the canonical production inventory")
+    if not isinstance(fingerprint, str) or not fingerprint or "fixture" in fingerprint.lower():
+        raise ValueError("initialization audit manifest target is not a production fingerprint")
+    if not isinstance(target["key_count"], int) or target["key_count"] <= 0:
+        raise ValueError("initialization audit manifest target key_count is invalid")
+    if (
+        not isinstance(target_key_specs, Mapping)
+        or len(target_key_specs) != target["key_count"]
+        or any(
+            not isinstance(key, str)
+            or not key
+            or "tinyfrozenbackbone" in key.lower()
+            or not isinstance(spec, Mapping)
+            or set(spec) != {"dtype", "shape"}
+            for key, spec in target_key_specs.items()
+        )
+        or list(target_key_specs) != sorted(target_key_specs)
+    ):
+        raise ValueError("initialization audit manifest target inventory is invalid or fixture-derived")
+
+    provenance = _require_mapping(target["siglip2_snapshot"], name="target.siglip2_snapshot")
+    for field_name in ("backbone_id", "revision", "state", "bridge_transfer_excluded"):
+        if field_name not in provenance:
+            raise ValueError(f"initialization audit manifest SigLIP2 provenance missing {field_name}")
+    if provenance["state"] != "frozen" or provenance["bridge_transfer_excluded"] is not True:
+        raise ValueError("initialization audit manifest SigLIP2 provenance is not frozen/excluded")
+
+    entries = manifest["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("initialization audit manifest entries must be a non-empty list")
+    source_keys: set[str] = set()
+    target_keys_from_entries: set[str] = set()
+    transferred_target_keys: set[str] = set()
+    for index, entry_value in enumerate(entries):
+        entry = _require_mapping(entry_value, name=f"entries[{index}]")
+        for field_name in ("side", "key", "state", "reason"):
+            if not isinstance(entry.get(field_name), str) or not entry[field_name]:
+                raise ValueError(f"initialization audit manifest entry {index} missing {field_name}")
+        side = entry["side"]
+        state = entry["state"]
+        if side not in {"source", "target"}:
+            raise ValueError(f"initialization audit manifest entry {index} has invalid side")
+        if state not in {"transferred", "fresh", "rejected"}:
+            raise ValueError(f"initialization audit manifest entry {index} has invalid state")
+        if side == "source":
+            if entry["key"] in source_keys:
+                raise ValueError("initialization audit manifest repeats a source key")
+            source_keys.add(entry["key"])
+            if state == "fresh":
+                raise ValueError("initialization audit manifest cannot mark a source fresh")
+            if state == "transferred":
+                if not isinstance(entry.get("target_key"), str) or not entry["target_key"]:
+                    raise ValueError("transferred initialization entry missing target_key")
+                transferred_target_keys.add(entry["target_key"])
+        else:
+            if entry["key"] in target_keys_from_entries:
+                raise ValueError("initialization audit manifest repeats a target key")
+            target_keys_from_entries.add(entry["key"])
+            if state == "rejected":
+                raise ValueError("initialization audit manifest cannot reject a target")
+    target_keys = set(target_key_specs)
+    if target_keys_from_entries != target_keys:
+        raise ValueError("initialization audit manifest target inventory disagrees with entries")
+    if not transferred_target_keys <= target_keys_from_entries:
+        raise ValueError("initialization audit manifest transfers to an unknown target key")
+    target_entries_by_key = {entry["key"]: entry for entry in entries if entry["side"] == "target"}
+    for target_key in transferred_target_keys:
+        if target_entries_by_key[target_key]["state"] != "transferred":
+            raise ValueError("initialization audit manifest transfer disposition disagrees with target entry")
+    if not any(entry.get("state") == "transferred" for entry in entries):
+        raise ValueError("audit manifest cannot silently fall back to all-fresh initialization")
+
+
+def load_and_validate_audit_manifest(
+    path: Path,
+    bridge_artifact: Path,
+    *,
+    allow_fixture: bool = False,
+) -> dict[str, Any]:
+    """Load one Bridge audit manifest and validate it against the artifact identity."""
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("initialization audit manifest is not valid JSON") from error
+    _require_mapping(manifest, name="root")
+    _validate_audit_manifest_structure(manifest)
+    unsigned = dict(manifest)
+    actual_hash = unsigned.pop("manifest_sha256", None)
+    expected_hash = sha256_bytes(canonical_json_bytes(unsigned))
+    if actual_hash != expected_hash:
+        raise ValueError("initialization audit manifest hash mismatch")
+    artifact = manifest["artifact"]
+    if artifact.get("sha256") != sha256_file(bridge_artifact):
+        raise ValueError("initialization audit manifest artifact mismatch")
+    if artifact.get("size") != Path(bridge_artifact).stat().st_size:
+        raise ValueError("initialization audit manifest artifact size mismatch")
+    if artifact.get("format") != BRIDGE_ARTIFACT_FORMAT:
+        raise ValueError("initialization audit manifest artifact format mismatch")
+    if artifact.get("source_index") != APPROVED_SOURCE_INDEX:
+        raise ValueError("only ensemble_components[0] may initialize W3")
+    if not allow_fixture:
+        expected = audit_bridge_checkpoint(
+            Path(bridge_artifact),
+            target_inventory=build_production_target_inventory(),
+        )
+        if canonical_json_bytes(expected) != canonical_json_bytes(dict(manifest)):
+            raise ValueError("initialization audit manifest does not match the canonical production audit")
+    if not any(entry.get("state") == "transferred" for entry in manifest.get("entries", [])):
+        raise ValueError("audit manifest cannot silently fall back to all-fresh initialization")
+    return dict(manifest)
+
+
 def _inventory_matches_model(model: nn.Module, inventory: TargetInventory) -> None:
     model_inventory = _target_inventory_from_model(model)
     if model_inventory.fingerprint != inventory.fingerprint:

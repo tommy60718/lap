@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 
 from PIL import Image
 import pytest
 import torch
 
-from lap.verifiers.cover.command import _audit_manifest
+from lap.verifiers.cover import command
+from lap.verifiers.cover.bridge_audit import load_and_validate_audit_manifest
 from lap.verifiers.cover.command import preflight_w3
 from lap.verifiers.cover.command import staged_diagnostic
 from lap.verifiers.cover.w3_contracts import canonical_bytes
@@ -90,15 +92,86 @@ def _audit_fixture(tmp_path):
     return artifact, audit
 
 
-def test_preflight_validates_inputs_before_publication(tmp_path):
+def test_production_preflight_requires_complete_protocol_directory(tmp_path):
     w2 = _fixture_export(tmp_path)
     artifact, audit = _audit_fixture(tmp_path)
+
+    with pytest.raises(TypeError, match="protocol_dir"):
+        preflight_w3(
+            w2_root=w2,
+            bridge_artifact=artifact,
+            audit_manifest=audit,
+            output_root=tmp_path / "absent",
+        )
+    with pytest.raises(ValueError, match="protocol_dir"):
+        preflight_w3(
+            w2_root=w2,
+            bridge_artifact=artifact,
+            audit_manifest=audit,
+            output_root=tmp_path / "absent",
+            protocol_dir=None,
+        )
+
+
+def test_command_delegates_audit_validation_to_bridge_owner():
+    source = inspect.getsource(command)
+    assert "load_and_validate_audit_manifest" in source
+    assert "def _validate_audit_manifest_structure" not in source
+    assert "def _audit_manifest" not in source
+    assert inspect.isfunction(load_and_validate_audit_manifest)
+
+
+def test_preflight_validates_inputs_before_publication(tmp_path, monkeypatch):
+    w2 = _fixture_export(tmp_path)
+    artifact, audit = _audit_fixture(tmp_path)
+    protocol_dir = tmp_path / "protocol"
+    protocol_dir.mkdir()
+    monkeypatch.setattr(
+        "lap.verifiers.cover.command.validate_protocol_directory",
+        lambda *_args, **_kwargs: {
+            "protocol": {
+                "content_hash": "a" * 64,
+                "artifacts": {"batch_probe_receipt": "b" * 64},
+                "identities": {"train_manifest_hash": "c" * 64},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "lap.verifiers.cover.command.W2DatasetGateway",
+        lambda *args, **kwargs: type(
+            "Gateway",
+            (),
+            {
+                "train": [object()],
+                "validation": [object()],
+                "train_manifest_hash": "c" * 64,
+                "validation_receipt": {
+                    "export_schema": "fixture",
+                    "content_hash": "d" * 64,
+                },
+            },
+        )(),
+    )
     receipt = preflight_w3(
-        w2_root=w2, bridge_artifact=artifact, audit_manifest=audit, output_root=tmp_path / "absent", fixture=True
+        w2_root=w2,
+        bridge_artifact=artifact,
+        audit_manifest=audit,
+        output_root=tmp_path / "absent",
+        protocol_dir=protocol_dir,
+        fixture=True,
     )
     assert receipt["publication"]["accepted"] is False
+    assert receipt["protocol"]["run_protocol_hash"] == "a" * 64
+    assert receipt["protocol"]["artifact_hashes"]["batch_probe_receipt"] == "b" * 64
     with pytest.raises(FileExistsError):
-        preflight_w3(w2_root=w2, bridge_artifact=artifact, audit_manifest=audit, output_root=tmp_path, fixture=True)
+        preflight_w3(
+            w2_root=w2,
+            bridge_artifact=artifact,
+            audit_manifest=audit,
+            output_root=tmp_path,
+            protocol_dir=protocol_dir,
+            fixture=True,
+        )
 
 
 def test_failed_flow_can_only_leave_explicit_diagnostic_stage(tmp_path):
@@ -116,7 +189,7 @@ def test_audit_manifest_rejects_other_ensemble_member(tmp_path):
     data["manifest_sha256"] = hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
     audit.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")), encoding="utf-8")
     with pytest.raises(ValueError, match="initialize W3"):
-        _audit_manifest(audit, artifact)
+        load_and_validate_audit_manifest(audit, artifact)
 
 
 def test_audit_manifest_rejects_rehashed_wrong_schema(tmp_path):
@@ -129,7 +202,7 @@ def test_audit_manifest_rejects_rehashed_wrong_schema(tmp_path):
     audit.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 
     with pytest.raises(ValueError, match="schema"):
-        _audit_manifest(audit, artifact)
+        load_and_validate_audit_manifest(audit, artifact)
 
 
 def test_audit_manifest_rejects_missing_reason_code(tmp_path):
@@ -142,7 +215,7 @@ def test_audit_manifest_rejects_missing_reason_code(tmp_path):
     audit.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 
     with pytest.raises(ValueError, match=r"entry|reason"):
-        _audit_manifest(audit, artifact)
+        load_and_validate_audit_manifest(audit, artifact)
 
 
 def test_audit_manifest_rejects_fixture_target_inventory(tmp_path):
@@ -167,4 +240,4 @@ def test_audit_manifest_rejects_fixture_target_inventory(tmp_path):
     audit.write_text(json.dumps(data, sort_keys=True, separators=(",", ":")), encoding="utf-8")
 
     with pytest.raises(ValueError, match=r"fixture|production|target"):
-        _audit_manifest(audit, artifact)
+        load_and_validate_audit_manifest(audit, artifact)
