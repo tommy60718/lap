@@ -165,6 +165,48 @@ def test_accepted_receipt_allows_w3_02_audit_loader_ownership_move():
     )
 
 
+def test_canonical_receipt_rejects_bridge_audit_transitive_helper_drift(monkeypatch):
+    """Public-seam reproduction of residual R6: private helper drift must fail closed."""
+    receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
+    committed = subprocess.check_output(
+        ["git", "show", "HEAD:src/lap/verifiers/cover/bridge_audit.py"],
+        text=True,
+    )
+    mutated = committed.replace(
+        "def _inventory_matches_model(model: nn.Module, inventory: TargetInventory) -> None:\n"
+        "    model_inventory = _target_inventory_from_model(model)\n"
+        "    if model_inventory.fingerprint != inventory.fingerprint:\n"
+        '        raise ValueError("model target inventory does not match audit target inventory fingerprint")\n',
+        "def _inventory_matches_model(model: nn.Module, inventory: TargetInventory) -> None:\n    return None\n",
+        1,
+    )
+    assert mutated != committed
+    assert "def apply_audited_initialization(" in mutated
+    monkeypatch.setattr(protocol_module, "_current_lap_revision", lambda: "b" * 40)
+
+    def fake_run(args, **kwargs):
+        if "merge-base" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        raise AssertionError(args)
+
+    def fake_check_output(args, **kwargs):
+        if "diff" in args and "--name-only" in args:
+            return ""
+        if "status" in args:
+            return " M src/lap/verifiers/cover/bridge_audit.py\n"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(protocol_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(protocol_module.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(
+        protocol_module,
+        "_read_bridge_audit_source",
+        lambda **kwargs: mutated if kwargs.get("worktree") else committed,
+    )
+    with pytest.raises(ValueError, match="uncommitted runtime-relevant changes"):
+        validate_batch_probe_receipt(receipt, require_canonical=True)
+
+
 def test_canonical_receipt_rejects_bridge_audit_producer_symbol_drift(monkeypatch):
     receipt = json.loads(Path("artifacts/w3/protocol/batch_probe_receipt.json").read_text(encoding="utf-8"))
     committed = subprocess.check_output(

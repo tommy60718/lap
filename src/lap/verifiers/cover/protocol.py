@@ -485,23 +485,13 @@ _CAPACITY_DEFINING_PATHS = frozenset(
         "src/lap/verifiers/cover/w3_contracts.py",
     }
 )
-_BRIDGE_AUDIT_CAPACITY_SYMBOLS = frozenset(
+# Identity-preserving W3-02 ownership move only. Everything else in
+# bridge_audit.py—including private transitive helpers—is capacity-binding.
+_BRIDGE_AUDIT_LOADER_ONLY_SYMBOLS = frozenset(
     {
-        "APPROVED_SOURCE_INDEX",
-        "AUDIT_SCHEMA",
-        "BRIDGE_ARTIFACT_FORMAT",
-        "CANONICAL_TARGET_KIND",
-        "DEFAULT_SIGLIP2_SNAPSHOT_PROVENANCE",
-        "EXPECTED_BRIDGE_SHA256",
-        "EXPECTED_BRIDGE_SIZE",
-        "REJECTED_SOURCE_REASONS",
-        "SEMANTICALLY_INCOMPATIBLE_PREFIXES",
-        "TRANSFERRED_PREFIXES",
-        "TargetInventory",
-        "TargetTensor",
-        "apply_audited_initialization",
-        "audit_bridge_checkpoint",
-        "build_production_target_inventory",
+        "_require_mapping",
+        "_validate_audit_manifest_structure",
+        "load_and_validate_audit_manifest",
     }
 )
 
@@ -514,34 +504,38 @@ def _is_runtime_relevant_path(path: str) -> bool:
     """Return whether a path hard-fails immutable capacity evidence.
 
     Downstream orchestration, checkpoint, evaluator, CLI, protocol-validator
-    policy, and identity-preserving `bridge_audit` loader ownership moves must
-    not force a new GPU probe. Capacity-defining model/training/probe/data/
-    contract modules and environment lockfiles still fail closed. Audit
-    producer surfaces in `bridge_audit.py` are checked by symbol continuity,
-    while audit/target/initialization *identities* fail closed through content
-    validation.
+    policy, and the W3-02 audit-loader ownership move must not force a new GPU
+    probe. Capacity-defining model/training/probe/data/contract modules and
+    environment lockfiles still fail closed. For `bridge_audit.py`, every
+    top-level definition except the loader-only ownership surface is compared,
+    so private transitive initialization helpers fail closed without a manual
+    producer-symbol list.
     """
     return _normalize_repo_path(path) in _CAPACITY_DEFINING_PATHS
 
 
-def _extract_named_sources(source: str, names: frozenset[str]) -> dict[str, str]:
+def _top_level_definition_name(node: ast.AST) -> str | None:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name
+    if isinstance(node, ast.Assign):
+        names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+        return names[0] if len(names) == 1 else None
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.target.id
+    return None
+
+
+def _extract_capacity_binding_sources(source: str) -> dict[str, str]:
+    """Return top-level bridge_audit definitions excluding the loader-only move."""
     tree = ast.parse(source)
     extracted: dict[str, str] = {}
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names:
-            segment = ast.get_source_segment(source, node)
-            if segment is not None:
-                extracted[node.name] = segment
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id in names:
-                    segment = ast.get_source_segment(source, node)
-                    if segment is not None:
-                        extracted[target.id] = segment
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id in names:
-            segment = ast.get_source_segment(source, node)
-            if segment is not None:
-                extracted[node.target.id] = segment
+        name = _top_level_definition_name(node)
+        if name is None or name in _BRIDGE_AUDIT_LOADER_ONLY_SYMBOLS:
+            continue
+        segment = ast.get_source_segment(source, node)
+        if segment is not None:
+            extracted[name] = segment
     return extracted
 
 
@@ -557,24 +551,20 @@ def _read_bridge_audit_source(*, revision: str | None = None, worktree: bool = F
     )
 
 
-def _bridge_audit_capacity_symbols_changed(*, baseline_revision: str, worktree: bool) -> bool:
-    baseline = _extract_named_sources(
-        _read_bridge_audit_source(revision=baseline_revision),
-        _BRIDGE_AUDIT_CAPACITY_SYMBOLS,
-    )
-    current = _extract_named_sources(
-        _read_bridge_audit_source(worktree=worktree)
+def _bridge_audit_capacity_surface_changed(*, baseline_revision: str, worktree: bool) -> bool:
+    baseline = _extract_capacity_binding_sources(_read_bridge_audit_source(revision=baseline_revision))
+    current_source = (
+        _read_bridge_audit_source(worktree=True)
         if worktree
-        else _read_bridge_audit_source(revision=_current_lap_revision()),
-        _BRIDGE_AUDIT_CAPACITY_SYMBOLS,
+        else _read_bridge_audit_source(revision=_current_lap_revision())
     )
-    return baseline != current
+    return baseline != _extract_capacity_binding_sources(current_source)
 
 
 def _path_invalidates_capacity(path: str, *, baseline_revision: str, worktree: bool) -> bool:
     normalized = _normalize_repo_path(path)
     if normalized == _BRIDGE_AUDIT_PATH:
-        return _bridge_audit_capacity_symbols_changed(
+        return _bridge_audit_capacity_surface_changed(
             baseline_revision=baseline_revision,
             worktree=worktree,
         )
