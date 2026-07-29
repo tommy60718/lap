@@ -59,10 +59,33 @@ def _contract(**overrides):
             "phrase_manifest_hash": "f" * 64,
             "normalization_artifact_hash": "1" * 64,
         },
-        environment={"torch": torch.__version__, "cuda_available": False},
+        environment={
+            "torch": torch.__version__,
+            "cuda_available": False,
+            "cuda_rng_device_count": 0,
+        },
     )
     contract.update(overrides)
     return contract
+
+
+def _cpu_rng_payload() -> dict:
+    numpy_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "algorithm": numpy_state[0],
+            "keys": numpy_state[1].tolist(),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        },
+        "torch": torch.get_rng_state(),
+    }
+
+
+def _fake_cuda_entries(count: int) -> list[torch.Tensor]:
+    return [torch.zeros(8, dtype=torch.uint8) for _ in range(count)]
 
 
 def _progress(**overrides):
@@ -594,6 +617,273 @@ def test_valid_complete_checkpoint_still_resumes_exactly_after_r3_guards(tmp_pat
     )
     assert loaded["progress"] == progress
     assert loaded["sampler_state"] == {"epoch": 4, "rank": 0, "world_size": 1}
+    for name, tensor in model.state_dict().items():
+        torch.testing.assert_close(tensor.cpu(), saved_state[name], atol=0.0, rtol=0.0)
+    after = _forward(model)
+    for key in ("semantic", "action", "logits"):
+        torch.testing.assert_close(after[key], before[key], atol=0.0, rtol=0.0)
+    assert after["loss"] == before["loss"]
+
+
+def test_type_invalid_sampler_fields_reject_before_mutation(tmp_path):
+    """W3-06-R4: sampler fields must be actual integers; no int(...) coercion."""
+
+    source = _model()
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    contract = _contract()
+    path = tmp_path / "latest.pt"
+    save_training_checkpoint(
+        path,
+        model=source,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=_progress(),
+        contract=contract,
+        sampler_state={"epoch": 1, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+
+    target = _model()
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=1)
+
+    invalid_cases = (
+        {"epoch": "1", "rank": 0, "world_size": 1},
+        {"epoch": 1.0, "rank": 0, "world_size": 1},
+        {"epoch": True, "rank": 0, "world_size": 1},
+        {"epoch": 1, "rank": "0", "world_size": 1},
+        {"epoch": 1, "rank": 0.0, "world_size": 1},
+        {"epoch": 1, "rank": False, "world_size": 1},
+        {"epoch": 1, "rank": 0, "world_size": "1"},
+        {"epoch": 1, "rank": 0, "world_size": 1.0},
+        {"epoch": 1, "rank": 0, "world_size": True},
+    )
+    for broken in invalid_cases:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload["sampler_state"] = broken
+        torch.save(payload, path)
+        torch.manual_seed(17)
+        np.random.seed(17)
+        pristine = _snapshot_caller_owned_state(target, target_optimizer, target_scheduler)
+        with pytest.raises(ValueError, match=r"sampler|integer"):
+            load_training_checkpoint(
+                path,
+                model=target,
+                optimizer=target_optimizer,
+                scheduler=target_scheduler,
+                expected_contract=contract,
+                rank=0,
+            )
+        _assert_caller_owned_state_unchanged(target, target_optimizer, target_scheduler, pristine)
+
+
+def test_cpu_contract_rejects_cuda_rng_payload_before_mutation(tmp_path):
+    """W3-06-R4: cuda_rng_device_count=0 forbids any cuda RNG payload."""
+
+    source = _model()
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    contract = _contract()
+    path = tmp_path / "latest.pt"
+    save_training_checkpoint(
+        path,
+        model=source,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=_progress(),
+        contract=contract,
+        sampler_state={"epoch": 1, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["rng_states"][0]["cuda"] = _fake_cuda_entries(1)
+    torch.save(payload, path)
+
+    target = _model()
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=1)
+    torch.manual_seed(19)
+    np.random.seed(19)
+    pristine = _snapshot_caller_owned_state(target, target_optimizer, target_scheduler)
+    with pytest.raises(ValueError, match=r"cuda|CPU-only|cuda_rng_device_count"):
+        load_training_checkpoint(
+            path,
+            model=target,
+            optimizer=target_optimizer,
+            scheduler=target_scheduler,
+            expected_contract=contract,
+            rank=0,
+        )
+    _assert_caller_owned_state_unchanged(target, target_optimizer, target_scheduler, pristine)
+
+
+def test_cuda_contract_rejects_incomplete_or_malformed_cuda_rng_before_mutation(tmp_path):
+    """W3-06-R4: positive cuda_rng_device_count requires exact per-rank CUDA cardinality."""
+
+    source = _model()
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    contract = _contract()
+    contract["environment"] = {
+        **contract["environment"],
+        "cuda_available": True,
+        "cuda_rng_device_count": 2,
+    }
+    path = tmp_path / "latest.pt"
+    # Build a valid CPU payload first, then rewrite contract + rng for CUDA cases.
+    save_training_checkpoint(
+        path,
+        model=source,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=_progress(),
+        contract=_contract(),
+        sampler_state={"epoch": 1, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+    base = torch.load(path, map_location="cpu", weights_only=False)
+
+    target = _model()
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=1)
+
+    broken_rng_cases = (
+        {0: _cpu_rng_payload()},  # missing cuda
+        {0: {**_cpu_rng_payload(), "cuda": []}},  # empty
+        {0: {**_cpu_rng_payload(), "cuda": _fake_cuda_entries(1)}},  # truncated
+        {0: {**_cpu_rng_payload(), "cuda": _fake_cuda_entries(3)}},  # oversized
+        {0: {**_cpu_rng_payload(), "cuda": [torch.zeros(8, dtype=torch.float32), torch.zeros(8, dtype=torch.uint8)]}},
+    )
+    for rng_states in broken_rng_cases:
+        payload = copy.deepcopy(base)
+        payload["contract"] = contract
+        payload["rng_states"] = rng_states
+        torch.save(payload, path)
+        torch.manual_seed(23)
+        np.random.seed(23)
+        pristine = _snapshot_caller_owned_state(target, target_optimizer, target_scheduler)
+        with pytest.raises(ValueError, match=r"cuda|RNG|ByteTensor|cardinality|device"):
+            load_training_checkpoint(
+                path,
+                model=target,
+                optimizer=target_optimizer,
+                scheduler=target_scheduler,
+                expected_contract=contract,
+                rank=0,
+            )
+        _assert_caller_owned_state_unchanged(target, target_optimizer, target_scheduler, pristine)
+
+
+def test_cuda_runtime_unavailable_or_cardinality_mismatch_rejects_before_mutation(tmp_path, monkeypatch):
+    """W3-06-R4: load-time CUDA availability/count is a compatibility gate only."""
+
+    source = _model()
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    path = tmp_path / "latest.pt"
+    save_training_checkpoint(
+        path,
+        model=source,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=_progress(),
+        contract=_contract(),
+        sampler_state={"epoch": 1, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+    contract = _contract()
+    contract["environment"] = {
+        **contract["environment"],
+        "cuda_available": True,
+        "cuda_rng_device_count": 2,
+    }
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["contract"] = contract
+    payload["rng_states"] = {0: {**_cpu_rng_payload(), "cuda": _fake_cuda_entries(2)}}
+    torch.save(payload, path)
+
+    target = _model()
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=1)
+
+    # Host without usable CUDA must reject a CUDA checkpoint before mutation.
+    torch.manual_seed(29)
+    np.random.seed(29)
+    pristine = _snapshot_caller_owned_state(target, target_optimizer, target_scheduler)
+    with pytest.raises(ValueError, match=r"CUDA|cuda|unavailable|device"):
+        load_training_checkpoint(
+            path,
+            model=target,
+            optimizer=target_optimizer,
+            scheduler=target_scheduler,
+            expected_contract=contract,
+            rank=0,
+        )
+    _assert_caller_owned_state_unchanged(target, target_optimizer, target_scheduler, pristine)
+
+    # Visible cardinality mismatch must also reject before mutation.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    with pytest.raises(ValueError, match=r"CUDA|cuda|cardinality|device"):
+        load_training_checkpoint(
+            path,
+            model=target,
+            optimizer=target_optimizer,
+            scheduler=target_scheduler,
+            expected_contract=contract,
+            rank=0,
+        )
+    _assert_caller_owned_state_unchanged(target, target_optimizer, target_scheduler, pristine)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="W3-06-R4 real two-GPU resume requires two visible CUDA devices",
+)
+def test_real_two_gpu_checkpoint_resumes_exactly(tmp_path):
+    """W3-06-R4: complete two-GPU CUDA checkpoint resumes exactly on supported host."""
+
+    device_count = torch.cuda.device_count()
+    model = _model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    contract = _contract()
+    contract["environment"] = {
+        **contract["environment"],
+        "cuda_available": True,
+        "cuda_rng_device_count": device_count,
+    }
+    path = tmp_path / "latest.pt"
+    before = _forward(model)
+    saved_state = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+    torch.manual_seed(41)
+    np.random.seed(41)
+    torch.cuda.manual_seed_all(41)
+    save_training_checkpoint(
+        path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=_progress(),
+        contract=contract,
+        sampler_state={"epoch": 2, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    assert "cuda" in payload["rng_states"][0]
+    assert len(payload["rng_states"][0]["cuda"]) == device_count
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(1.0)
+    torch.manual_seed(99)
+    np.random.seed(99)
+    torch.cuda.manual_seed_all(99)
+    loaded = load_training_checkpoint(
+        path, model=model, optimizer=optimizer, scheduler=scheduler, expected_contract=contract, rank=0
+    )
+    assert loaded["sampler_state"] == {"epoch": 2, "rank": 0, "world_size": 1}
     for name, tensor in model.state_dict().items():
         torch.testing.assert_close(tensor.cpu(), saved_state[name], atol=0.0, rtol=0.0)
     after = _forward(model)

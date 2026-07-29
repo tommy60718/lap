@@ -53,6 +53,7 @@ REQUIRED_DEPLOYMENT_INDEX_FILES = frozenset(
 )
 REQUIRED_SAMPLER_KEYS = ("epoch", "rank", "world_size")
 REQUIRED_NUMPY_RNG_KEYS = ("algorithm", "keys", "position", "has_gauss", "cached_gaussian")
+CUDA_RNG_DEVICE_COUNT_KEY = "cuda_rng_device_count"
 
 
 def build_four_state_inventory() -> dict[str, list[str]]:
@@ -109,6 +110,22 @@ def build_progress(
     }
 
 
+def recorded_cuda_rng_device_count() -> int:
+    """Authoritative save-time CUDA RNG cardinality for contract.environment."""
+
+    if not torch.cuda.is_available():
+        return 0
+    return torch.cuda.device_count()
+
+
+def _require_exact_int(value: Any, *, name: str, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an actual integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return value
+
+
 def build_checkpoint_contract(
     *,
     audit_manifest_sha256: str,
@@ -124,6 +141,12 @@ def build_checkpoint_contract(
     inventory = {key: list(values) for key, values in four_state_inventory.items()}
     if set(inventory) != {"frozen", "warm_started", "fresh", "forbidden"}:
         raise ValueError("four_state_inventory must contain frozen/warm_started/fresh/forbidden")
+    environment = dict(environment)
+    _require_exact_int(
+        environment.get(CUDA_RNG_DEVICE_COUNT_KEY),
+        name=f"environment.{CUDA_RNG_DEVICE_COUNT_KEY}",
+        minimum=0,
+    )
     return {
         "resume_kind": RESUME_KIND,
         "w3_01_initialization": {
@@ -138,7 +161,7 @@ def build_checkpoint_contract(
         "four_state_inventory": inventory,
         "model_config": dict(model_config),
         "w2_identities": dict(w2_identities),
-        "environment": dict(environment),
+        "environment": environment,
     }
 
 
@@ -154,7 +177,11 @@ def select_best_checkpoint(records: Sequence[Mapping[str, Any]]) -> Path:
     return Path(best["path"])
 
 
-def capture_rng_state() -> dict[str, Any]:
+def capture_rng_state(*, cuda_rng_device_count: int | None = None) -> dict[str, Any]:
+    if cuda_rng_device_count is None:
+        cuda_rng_device_count = recorded_cuda_rng_device_count()
+    else:
+        cuda_rng_device_count = _require_exact_int(cuda_rng_device_count, name=CUDA_RNG_DEVICE_COUNT_KEY, minimum=0)
     numpy_state = np.random.get_state()
     state = {
         "python": random.getstate(),
@@ -167,8 +194,14 @@ def capture_rng_state() -> dict[str, Any]:
         },
         "torch": torch.get_rng_state(),
     }
-    if torch.cuda.is_available():
+    if cuda_rng_device_count > 0:
+        _validate_cuda_runtime_compatibility(cuda_rng_device_count)
         state["cuda"] = torch.cuda.get_rng_state_all()
+        if len(state["cuda"]) != cuda_rng_device_count:
+            raise ValueError(
+                f"captured CUDA RNG cardinality {len(state['cuda'])} "
+                f"!= environment.{CUDA_RNG_DEVICE_COUNT_KEY}={cuda_rng_device_count}"
+            )
     return state
 
 
@@ -185,11 +218,56 @@ def restore_rng_state(state: dict[str, Any]) -> None:
         )
     )
     torch.set_rng_state(state["torch"])
-    if torch.cuda.is_available() and "cuda" in state:
+    if "cuda" in state:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def _validate_single_rng_payload(state: Mapping[str, Any], *, rank: int) -> dict[str, Any]:
+def _validate_cuda_runtime_compatibility(cuda_rng_device_count: int) -> None:
+    if cuda_rng_device_count <= 0:
+        return
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA checkpoint requires CUDA; runtime CUDA is unavailable")
+    visible = torch.cuda.device_count()
+    if visible != cuda_rng_device_count:
+        raise ValueError(
+            f"CUDA runtime device cardinality {visible} is incompatible with "
+            f"environment.{CUDA_RNG_DEVICE_COUNT_KEY}={cuda_rng_device_count}"
+        )
+
+
+def _dry_run_rng_restoreability(state: Mapping[str, Any], *, rank: int, cuda_rng_device_count: int) -> None:
+    """Prove RNG restoreability without mutating process-global generators."""
+
+    try:
+        random.Random().setstate(state["python"])
+    except Exception as error:
+        raise ValueError(f"checkpoint rng_states[{rank}] python RNG is incompatible") from error
+    numpy_state = state["numpy"]
+    try:
+        np.random.RandomState().set_state(
+            (
+                numpy_state["algorithm"],
+                np.asarray(numpy_state["keys"], dtype=np.uint32),
+                numpy_state["position"],
+                numpy_state["has_gauss"],
+                numpy_state["cached_gaussian"],
+            )
+        )
+    except Exception as error:
+        raise ValueError(f"checkpoint rng_states[{rank}] numpy RNG is incompatible") from error
+    try:
+        torch.Generator().set_state(state["torch"])
+    except Exception as error:
+        raise ValueError(f"checkpoint rng_states[{rank}] torch RNG is incompatible") from error
+    if cuda_rng_device_count > 0 and torch.cuda.is_available() and torch.cuda.device_count() == cuda_rng_device_count:
+        try:
+            for index, entry in enumerate(state["cuda"]):
+                torch.Generator(device=f"cuda:{index}").set_state(entry)
+        except Exception as error:
+            raise ValueError(f"checkpoint rng_states[{rank}] cuda RNG is incompatible") from error
+
+
+def _validate_single_rng_payload(state: Mapping[str, Any], *, rank: int, cuda_rng_device_count: int) -> dict[str, Any]:
     state = _require_mapping(state, name=f"rng_states[{rank}]")
     for required in ("python", "numpy", "torch"):
         if required not in state:
@@ -203,28 +281,43 @@ def _validate_single_rng_payload(state: Mapping[str, Any], *, rank: int) -> dict
     torch_state = state["torch"]
     if not isinstance(torch_state, torch.Tensor) or torch_state.dtype != torch.uint8:
         raise ValueError(f"checkpoint rng_states[{rank}] torch RNG must be a ByteTensor")
-    if "cuda" in state:
+    if cuda_rng_device_count == 0:
+        if "cuda" in state:
+            raise ValueError(
+                f"checkpoint rng_states[{rank}] must omit cuda when "
+                f"environment.{CUDA_RNG_DEVICE_COUNT_KEY}=0 (CPU-only)"
+            )
+    else:
+        if "cuda" not in state:
+            raise ValueError(
+                f"checkpoint rng_states[{rank}] missing cuda RNG for "
+                f"environment.{CUDA_RNG_DEVICE_COUNT_KEY}={cuda_rng_device_count}"
+            )
         cuda_state = state["cuda"]
-        if not isinstance(cuda_state, (list, tuple)) or not cuda_state:
+        if not isinstance(cuda_state, (list, tuple)):
             raise ValueError(f"checkpoint rng_states[{rank}] cuda RNG payload is incompatible")
+        if len(cuda_state) != cuda_rng_device_count:
+            raise ValueError(
+                f"checkpoint rng_states[{rank}] cuda RNG cardinality {len(cuda_state)} "
+                f"!= environment.{CUDA_RNG_DEVICE_COUNT_KEY}={cuda_rng_device_count}"
+            )
+        if not cuda_state:
+            raise ValueError(f"checkpoint rng_states[{rank}] cuda RNG payload is empty")
         for index, entry in enumerate(cuda_state):
             if not isinstance(entry, torch.Tensor) or entry.dtype != torch.uint8:
                 raise ValueError(f"checkpoint rng_states[{rank}] cuda[{index}] must be a ByteTensor")
     return dict(state)
 
 
-def _validate_rng_states(rng_states: Mapping[int, Mapping[str, Any]]) -> dict[int, dict[str, Any]]:
-    validated = {int(rank): _validate_single_rng_payload(state, rank=int(rank)) for rank, state in rng_states.items()}
-    # Prove restoreability without leaving caller RNG mutated.
-    snapshot = capture_rng_state()
-    try:
-        for rank, state in validated.items():
-            try:
-                restore_rng_state(state)
-            except Exception as error:
-                raise ValueError(f"checkpoint rng_states[{rank}] is incompatible") from error
-    finally:
-        restore_rng_state(snapshot)
+def _validate_rng_states(
+    rng_states: Mapping[int, Mapping[str, Any]], *, cuda_rng_device_count: int
+) -> dict[int, dict[str, Any]]:
+    validated = {
+        int(rank): _validate_single_rng_payload(state, rank=int(rank), cuda_rng_device_count=cuda_rng_device_count)
+        for rank, state in rng_states.items()
+    }
+    for rank, state in validated.items():
+        _dry_run_rng_restoreability(state, rank=rank, cuda_rng_device_count=cuda_rng_device_count)
     return validated
 
 
@@ -236,18 +329,13 @@ def _validate_sampler_state(sampler_state: Mapping[str, Any], *, world_size: int
     unexpected = set(sampler_state) - set(REQUIRED_SAMPLER_KEYS)
     if unexpected:
         raise ValueError(f"checkpoint sampler_state contains unexpected keys: {sorted(unexpected)}")
-    try:
-        epoch = int(sampler_state["epoch"])
-        rank = int(sampler_state["rank"])
-        sampler_world_size = int(sampler_state["world_size"])
-    except (TypeError, ValueError) as error:
-        raise ValueError("checkpoint sampler_state fields must be integers") from error
-    if sampler_world_size != int(world_size):
+    epoch = _require_exact_int(sampler_state["epoch"], name="sampler_state.epoch", minimum=0)
+    rank = _require_exact_int(sampler_state["rank"], name="sampler_state.rank", minimum=0)
+    sampler_world_size = _require_exact_int(sampler_state["world_size"], name="sampler_state.world_size", minimum=1)
+    if sampler_world_size != world_size:
         raise ValueError("checkpoint sampler_state world_size is incompatible with progress")
-    if rank < 0 or rank >= sampler_world_size:
+    if rank >= sampler_world_size:
         raise ValueError("checkpoint sampler_state rank is incompatible with world_size")
-    if epoch < 0:
-        raise ValueError("checkpoint sampler_state epoch must be non-negative")
     return {"epoch": epoch, "rank": rank, "world_size": sampler_world_size}
 
 
@@ -294,6 +382,16 @@ def _validate_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     inventory = _require_mapping(contract["four_state_inventory"], name="four_state_inventory")
     if set(inventory) != {"frozen", "warm_started", "fresh", "forbidden"}:
         raise ValueError("checkpoint contract four_state_inventory is incomplete")
+    environment = _require_mapping(contract["environment"], name="environment")
+    if CUDA_RNG_DEVICE_COUNT_KEY not in environment:
+        raise ValueError(f"checkpoint contract environment missing {CUDA_RNG_DEVICE_COUNT_KEY}")
+    environment = dict(environment)
+    environment[CUDA_RNG_DEVICE_COUNT_KEY] = _require_exact_int(
+        environment[CUDA_RNG_DEVICE_COUNT_KEY],
+        name=f"environment.{CUDA_RNG_DEVICE_COUNT_KEY}",
+        minimum=0,
+    )
+    contract["environment"] = environment
     return contract
 
 
@@ -303,11 +401,12 @@ def _normalize_rng_states(
     rank: int,
     rng_states: Mapping[Any, Any] | None,
     complete: bool,
+    cuda_rng_device_count: int,
 ) -> dict[int, dict[str, Any]]:
     if rng_states is None:
         if complete and world_size != 1:
             raise ValueError("two-rank checkpoints require explicit per-rank rng_states")
-        normalized = {int(rank): capture_rng_state()}
+        normalized = {int(rank): capture_rng_state(cuda_rng_device_count=cuda_rng_device_count)}
     else:
         normalized = {}
         for key, value in rng_states.items():
@@ -315,7 +414,7 @@ def _normalize_rng_states(
     if complete and set(normalized) != set(range(world_size)):
         raise ValueError("checkpoint rng_states must cover every rank in world_size")
     for rank_key, state in normalized.items():
-        _validate_single_rng_payload(state, rank=int(rank_key))
+        _validate_single_rng_payload(state, rank=int(rank_key), cuda_rng_device_count=cuda_rng_device_count)
     return normalized
 
 
@@ -357,13 +456,15 @@ def save_training_checkpoint(
     progress = _validate_progress(progress)
     contract = _validate_contract(contract)
     sampler_state = _validate_sampler_state(sampler_state, world_size=progress["world_size"])
+    cuda_rng_device_count = contract["environment"][CUDA_RNG_DEVICE_COUNT_KEY]
     normalized_rng = _normalize_rng_states(
         world_size=progress["world_size"],
         rank=rank,
         rng_states=rng_states,
         complete=True,
+        cuda_rng_device_count=cuda_rng_device_count,
     )
-    normalized_rng = _validate_rng_states(normalized_rng)
+    normalized_rng = _validate_rng_states(normalized_rng, cuda_rng_device_count=cuda_rng_device_count)
     payload = {
         "schema": W3_CHECKPOINT_SCHEMA,
         "model_state": _model_state(model),
@@ -401,11 +502,13 @@ def _validate_training_payload(
     if contract != dict(expected_contract):
         raise ValueError("checkpoint contract mismatch before state restore")
     progress = _validate_progress(_require_mapping(payload["progress"], name="progress"))
+    cuda_rng_device_count = contract["environment"][CUDA_RNG_DEVICE_COUNT_KEY]
     rng_states = _normalize_rng_states(
         world_size=progress["world_size"],
         rank=rank,
         rng_states=_require_mapping(payload["rng_states"], name="rng_states"),
         complete=True,
+        cuda_rng_device_count=cuda_rng_device_count,
     )
     if int(rank) not in rng_states:
         raise ValueError(f"checkpoint rng_states missing rank {rank}")
@@ -424,7 +527,8 @@ def _validate_training_payload(
     unexpected = set(payload) - set(REQUIRED_TRAINING_PAYLOAD_KEYS)
     if unexpected:
         raise ValueError(f"checkpoint contains unexpected keys: {sorted(unexpected)}")
-    rng_states = _validate_rng_states(rng_states)
+    rng_states = _validate_rng_states(rng_states, cuda_rng_device_count=cuda_rng_device_count)
+    _validate_cuda_runtime_compatibility(cuda_rng_device_count)
     return {
         "progress": progress,
         "contract": contract,

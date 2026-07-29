@@ -16,6 +16,7 @@ from lap.verifiers.cover.checkpoint import build_four_state_inventory
 from lap.verifiers.cover.checkpoint import build_progress
 from lap.verifiers.cover.checkpoint import capture_rng_state
 from lap.verifiers.cover.checkpoint import publish_deployment_bundle
+from lap.verifiers.cover.checkpoint import recorded_cuda_rng_device_count
 from lap.verifiers.cover.checkpoint import save_training_checkpoint
 from lap.verifiers.cover.command import preflight_w3
 from lap.verifiers.cover.data import TwoViewDataset
@@ -131,7 +132,11 @@ def train_model(
                 world_size=protocol.world_size,
             )
             sampler_state = {"epoch": epoch, "rank": 0, "world_size": protocol.world_size}
-            rng_states = {rank: capture_rng_state() for rank in range(protocol.world_size)}
+            cuda_rng_device_count = checkpoint_contract["environment"]["cuda_rng_device_count"]
+            rng_states = {
+                rank: capture_rng_state(cuda_rng_device_count=cuda_rng_device_count)
+                for rank in range(protocol.world_size)
+            }
             save_training_checkpoint(
                 Path(checkpoint_dir) / "latest.pt",
                 model=model,
@@ -298,7 +303,11 @@ def run_fixture_end_to_end(*, output_root: Path) -> dict[str, Any]:
                     "phrase_manifest_hash": "fixture",
                     "normalization_artifact_hash": "fixture",
                 },
-                environment={"torch": torch.__version__, "fixture": True},
+                environment={
+                    "torch": torch.__version__,
+                    "fixture": True,
+                    "cuda_rng_device_count": recorded_cuda_rng_device_count(),
+                },
             ),
             sampler_state={"epoch": 0, "rank": 0, "world_size": 1},
             rank=0,
@@ -423,6 +432,7 @@ def run_train_mode(
                     "torch": torch.__version__,
                     "backbone_revision": getattr(model.backbone, "backbone_revision", None),
                     "views": ["base_rgb", "wrist_rgb"],
+                    "cuda_rng_device_count": recorded_cuda_rng_device_count(),
                 },
             ),
         )
@@ -588,6 +598,7 @@ def run_canonical_acceptance(
             "backbone_revision": getattr(model.backbone, "backbone_revision", None),
             "preprocessing_contract": "openclip_model_eval_transform_v1",
             "views": ["base_rgb", "wrist_rgb"],
+            "cuda_rng_device_count": recorded_cuda_rng_device_count(),
         },
     )
     training = train_model(
@@ -655,7 +666,12 @@ def run_canonical_acceptance(
                     "variant": "base_only",
                     "deployable": False,
                 },
-                environment={"torch": torch.__version__, "variant": "base_only", "deployable": False},
+                environment={
+                    "torch": torch.__version__,
+                    "variant": "base_only",
+                    "deployable": False,
+                    "cuda_rng_device_count": recorded_cuda_rng_device_count(),
+                },
             ),
             sampler_state={
                 "epoch": base_only["training"]["progress"]["epoch"],
@@ -664,7 +680,8 @@ def run_canonical_acceptance(
             },
             rank=0,
             rng_states={
-                rank: capture_rng_state() for rank in range(int(base_only["training"]["progress"]["world_size"]))
+                rank: capture_rng_state(cuda_rng_device_count=recorded_cuda_rng_device_count())
+                for rank in range(int(base_only["training"]["progress"]["world_size"]))
             },
         )
         (staging / "base_only" / "metadata.json").write_bytes(
