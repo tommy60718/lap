@@ -807,10 +807,12 @@ def test_cuda_runtime_unavailable_or_cardinality_mismatch_rejects_before_mutatio
     target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
     target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=1)
 
-    # Host without usable CUDA must reject a CUDA checkpoint before mutation.
     torch.manual_seed(29)
     np.random.seed(29)
     pristine = _snapshot_caller_owned_state(target, target_optimizer, target_scheduler)
+
+    # Force-unavailable must reject before mutation on any host, including 2-GPU.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(ValueError, match=r"CUDA|cuda|unavailable|device"):
         load_training_checkpoint(
             path,
