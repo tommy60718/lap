@@ -10,6 +10,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from lap.verifiers.cover import protocol as protocol_module
 from lap.verifiers.cover.bridge_audit import build_production_target_inventory
+from lap.verifiers.cover.bridge_audit import load_and_validate_audit_manifest
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import fingerprint_siglip2_assets
 from lap.verifiers.cover.protocol import APPROVED_SHUFFLED_EXCLUSIONS
@@ -126,17 +127,11 @@ def _rehash_receipt(receipt: dict) -> dict:
 
 
 def test_accepted_receipt_allows_w3_02_audit_loader_ownership_move():
-    """Live public-seam proof: dirty W3-02 bridge_audit loader move must not invalidate."""
+    """Committed W3-02 bridge_audit loader ownership must not invalidate capacity."""
     audit = json.loads(Path("artifacts/w3/bridge_audit_manifest.json").read_text(encoding="utf-8"))
-    dirty = subprocess.check_output(
-        ["git", "status", "--porcelain", "--", "src/lap/verifiers/cover/bridge_audit.py"], text=True
-    )
-    assert dirty.strip(), "expected preserved W3-02 bridge_audit ownership move in the worktree"
-    bridge_diff = subprocess.check_output(
-        ["git", "diff", "--", "src/lap/verifiers/cover/bridge_audit.py"],
-        text=True,
-    )
-    assert "def load_and_validate_audit_manifest" in bridge_diff
+    source = Path("src/lap/verifiers/cover/bridge_audit.py").read_text(encoding="utf-8")
+    assert "def load_and_validate_audit_manifest" in source
+    assert callable(load_and_validate_audit_manifest)
     validated = validate_protocol_directory(
         Path("artifacts/w3/protocol"),
         require_complete=True,
