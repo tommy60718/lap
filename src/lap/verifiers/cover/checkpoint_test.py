@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import random
 
 import numpy as np
 import pytest
@@ -447,3 +448,155 @@ def test_coherently_rehashed_incomplete_or_extra_content_index_is_rejected(tmp_p
             preprocessing=preprocess_rgb,
         )
     assert constructed == []
+
+
+def _snapshot_caller_owned_state(model, optimizer, scheduler):
+    return {
+        "model": {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()},
+        "optimizer": copy.deepcopy(optimizer.state_dict()),
+        "scheduler": copy.deepcopy(scheduler.state_dict()),
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state().clone(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _assert_caller_owned_state_unchanged(model, optimizer, scheduler, pristine):
+    for name, tensor in model.state_dict().items():
+        torch.testing.assert_close(tensor.cpu(), pristine["model"][name], atol=0.0, rtol=0.0)
+    assert optimizer.state_dict() == pristine["optimizer"]
+    assert scheduler.state_dict() == pristine["scheduler"]
+    assert random.getstate() == pristine["python"]
+    assert np.random.get_state()[1].tolist() == list(pristine["numpy"][1])
+    assert torch.equal(torch.get_rng_state(), pristine["torch"])
+    if pristine["cuda"] is not None:
+        current = torch.cuda.get_rng_state_all()
+        assert len(current) == len(pristine["cuda"])
+        for left, right in zip(current, pristine["cuda"], strict=True):
+            assert torch.equal(left, right)
+
+
+def test_malformed_rng_state_rejects_without_mutating_caller_owned_state(tmp_path):
+    """W3-06-R3: incompatible Torch RNG must fail closed before any live restore."""
+
+    source = _model()
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    contract = _contract()
+    path = tmp_path / "latest.pt"
+    save_training_checkpoint(
+        path,
+        model=source,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=_progress(),
+        contract=contract,
+        sampler_state={"epoch": 1, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["rng_states"][0]["torch"] = torch.tensor([1, 2, 3], dtype=torch.int64)
+    torch.save(payload, path)
+
+    target = _model()
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=1)
+    torch.manual_seed(321)
+    np.random.seed(321)
+    pristine = _snapshot_caller_owned_state(target, target_optimizer, target_scheduler)
+
+    with pytest.raises(ValueError, match=r"rng|RNG|ByteTensor|incompatible"):
+        load_training_checkpoint(
+            path,
+            model=target,
+            optimizer=target_optimizer,
+            scheduler=target_scheduler,
+            expected_contract=contract,
+            rank=0,
+        )
+    _assert_caller_owned_state_unchanged(target, target_optimizer, target_scheduler, pristine)
+
+
+def test_incomplete_or_incompatible_sampler_state_rejects_without_mutation(tmp_path):
+    """W3-06-R3: sampler schema/compatibility is validated before mutation."""
+
+    source = _model()
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    contract = _contract()
+    path = tmp_path / "latest.pt"
+    save_training_checkpoint(
+        path,
+        model=source,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=_progress(),
+        contract=contract,
+        sampler_state={"epoch": 1, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+
+    target = _model()
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1e-3)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=1)
+
+    for broken in (
+        {},
+        {"epoch": 1},
+        {"epoch": 1, "rank": 0, "world_size": 2},
+        {"epoch": 1, "rank": 0, "world_size": 1, "extra": True},
+    ):
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload["sampler_state"] = broken
+        torch.save(payload, path)
+        torch.manual_seed(11)
+        np.random.seed(11)
+        pristine = _snapshot_caller_owned_state(target, target_optimizer, target_scheduler)
+        with pytest.raises(ValueError, match=r"sampler"):
+            load_training_checkpoint(
+                path,
+                model=target,
+                optimizer=target_optimizer,
+                scheduler=target_scheduler,
+                expected_contract=contract,
+                rank=0,
+            )
+        _assert_caller_owned_state_unchanged(target, target_optimizer, target_scheduler, pristine)
+
+
+def test_valid_complete_checkpoint_still_resumes_exactly_after_r3_guards(tmp_path):
+    """Successful exact resume remains available after R3 validate-before-mutate guards."""
+
+    model = _model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    contract = _contract()
+    progress = _progress()
+    path = tmp_path / "latest.pt"
+    before = _forward(model)
+    saved_state = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+    save_training_checkpoint(
+        path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=progress,
+        contract=contract,
+        sampler_state={"epoch": 4, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(0.5)
+    loaded = load_training_checkpoint(
+        path, model=model, optimizer=optimizer, scheduler=scheduler, expected_contract=contract, rank=0
+    )
+    assert loaded["progress"] == progress
+    assert loaded["sampler_state"] == {"epoch": 4, "rank": 0, "world_size": 1}
+    for name, tensor in model.state_dict().items():
+        torch.testing.assert_close(tensor.cpu(), saved_state[name], atol=0.0, rtol=0.0)
+    after = _forward(model)
+    for key in ("semantic", "action", "logits"):
+        torch.testing.assert_close(after[key], before[key], atol=0.0, rtol=0.0)
+    assert after["loss"] == before["loss"]

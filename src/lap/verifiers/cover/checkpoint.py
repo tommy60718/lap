@@ -51,6 +51,8 @@ REQUIRED_DEPLOYMENT_INDEX_FILES = frozenset(
         ACCEPTED_DEPLOYMENT_MARKER,
     }
 )
+REQUIRED_SAMPLER_KEYS = ("epoch", "rank", "world_size")
+REQUIRED_NUMPY_RNG_KEYS = ("algorithm", "keys", "position", "has_gauss", "cached_gaussian")
 
 
 def build_four_state_inventory() -> dict[str, list[str]]:
@@ -187,6 +189,68 @@ def restore_rng_state(state: dict[str, Any]) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
+def _validate_single_rng_payload(state: Mapping[str, Any], *, rank: int) -> dict[str, Any]:
+    state = _require_mapping(state, name=f"rng_states[{rank}]")
+    for required in ("python", "numpy", "torch"):
+        if required not in state:
+            raise ValueError(f"checkpoint rng_states[{rank}] missing {required}")
+    if not isinstance(state["python"], tuple):
+        raise ValueError(f"checkpoint rng_states[{rank}] python payload is incompatible")
+    numpy_state = _require_mapping(state["numpy"], name=f"rng_states[{rank}].numpy")
+    missing = [key for key in REQUIRED_NUMPY_RNG_KEYS if key not in numpy_state]
+    if missing:
+        raise ValueError(f"checkpoint rng_states[{rank}] numpy payload missing keys: {missing}")
+    torch_state = state["torch"]
+    if not isinstance(torch_state, torch.Tensor) or torch_state.dtype != torch.uint8:
+        raise ValueError(f"checkpoint rng_states[{rank}] torch RNG must be a ByteTensor")
+    if "cuda" in state:
+        cuda_state = state["cuda"]
+        if not isinstance(cuda_state, (list, tuple)) or not cuda_state:
+            raise ValueError(f"checkpoint rng_states[{rank}] cuda RNG payload is incompatible")
+        for index, entry in enumerate(cuda_state):
+            if not isinstance(entry, torch.Tensor) or entry.dtype != torch.uint8:
+                raise ValueError(f"checkpoint rng_states[{rank}] cuda[{index}] must be a ByteTensor")
+    return dict(state)
+
+
+def _validate_rng_states(rng_states: Mapping[int, Mapping[str, Any]]) -> dict[int, dict[str, Any]]:
+    validated = {int(rank): _validate_single_rng_payload(state, rank=int(rank)) for rank, state in rng_states.items()}
+    # Prove restoreability without leaving caller RNG mutated.
+    snapshot = capture_rng_state()
+    try:
+        for rank, state in validated.items():
+            try:
+                restore_rng_state(state)
+            except Exception as error:
+                raise ValueError(f"checkpoint rng_states[{rank}] is incompatible") from error
+    finally:
+        restore_rng_state(snapshot)
+    return validated
+
+
+def _validate_sampler_state(sampler_state: Mapping[str, Any], *, world_size: int) -> dict[str, Any]:
+    sampler_state = _require_mapping(sampler_state, name="sampler_state")
+    missing = [key for key in REQUIRED_SAMPLER_KEYS if key not in sampler_state]
+    if missing:
+        raise ValueError(f"checkpoint sampler_state missing required keys: {missing}")
+    unexpected = set(sampler_state) - set(REQUIRED_SAMPLER_KEYS)
+    if unexpected:
+        raise ValueError(f"checkpoint sampler_state contains unexpected keys: {sorted(unexpected)}")
+    try:
+        epoch = int(sampler_state["epoch"])
+        rank = int(sampler_state["rank"])
+        sampler_world_size = int(sampler_state["world_size"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("checkpoint sampler_state fields must be integers") from error
+    if sampler_world_size != int(world_size):
+        raise ValueError("checkpoint sampler_state world_size is incompatible with progress")
+    if rank < 0 or rank >= sampler_world_size:
+        raise ValueError("checkpoint sampler_state rank is incompatible with world_size")
+    if epoch < 0:
+        raise ValueError("checkpoint sampler_state epoch must be non-negative")
+    return {"epoch": epoch, "rank": rank, "world_size": sampler_world_size}
+
+
 def _model_state(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
@@ -251,9 +315,7 @@ def _normalize_rng_states(
     if complete and set(normalized) != set(range(world_size)):
         raise ValueError("checkpoint rng_states must cover every rank in world_size")
     for rank_key, state in normalized.items():
-        for required in ("python", "numpy", "torch"):
-            if required not in state:
-                raise ValueError(f"checkpoint rng_states[{rank_key}] missing {required}")
+        _validate_single_rng_payload(state, rank=int(rank_key))
     return normalized
 
 
@@ -294,13 +356,14 @@ def save_training_checkpoint(
 ) -> None:
     progress = _validate_progress(progress)
     contract = _validate_contract(contract)
-    sampler_state = dict(sampler_state)
+    sampler_state = _validate_sampler_state(sampler_state, world_size=progress["world_size"])
     normalized_rng = _normalize_rng_states(
         world_size=progress["world_size"],
         rank=rank,
         rng_states=rng_states,
         complete=True,
     )
+    normalized_rng = _validate_rng_states(normalized_rng)
     payload = {
         "schema": W3_CHECKPOINT_SCHEMA,
         "model_state": _model_state(model),
@@ -350,7 +413,10 @@ def _validate_training_payload(
         raise ValueError("incomplete checkpoint missing optimizer_state")
     if "scheduler_state" not in payload:
         raise ValueError("incomplete checkpoint missing scheduler_state")
-    sampler_state = _require_mapping(payload["sampler_state"], name="sampler_state")
+    sampler_state = _validate_sampler_state(
+        _require_mapping(payload["sampler_state"], name="sampler_state"),
+        world_size=progress["world_size"],
+    )
     expected_keys = set(model.state_dict())
     actual_keys = set(_require_mapping(payload["model_state"], name="model_state"))
     if actual_keys != expected_keys:
@@ -358,11 +424,12 @@ def _validate_training_payload(
     unexpected = set(payload) - set(REQUIRED_TRAINING_PAYLOAD_KEYS)
     if unexpected:
         raise ValueError(f"checkpoint contains unexpected keys: {sorted(unexpected)}")
+    rng_states = _validate_rng_states(rng_states)
     return {
         "progress": progress,
         "contract": contract,
         "rng_states": rng_states,
-        "sampler_state": dict(sampler_state),
+        "sampler_state": sampler_state,
         "model_state": payload["model_state"],
         "optimizer_state": payload["optimizer_state"],
         "scheduler_state": payload["scheduler_state"],
