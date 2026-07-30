@@ -75,7 +75,13 @@ def dispatch(args: argparse.Namespace) -> dict:
     if args.mode == "evaluate":
         if args.checkpoint is None:
             raise ValueError("evaluate mode requires --checkpoint")
-        return run_evaluate_mode(checkpoint=args.checkpoint, output_root=args.output_root)
+        return run_evaluate_mode(
+            checkpoint=args.checkpoint,
+            output_root=args.output_root,
+            w2_root=args.w2_root,
+            protocol_dir=args.protocol_dir,
+            validator_path=args.validator,
+        )
     if args.mode == "package":
         if args.evidence_root is None:
             raise ValueError("package mode requires --evidence-root")

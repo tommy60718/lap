@@ -26,6 +26,9 @@ from lap.verifiers.cover.data import collate_two_view_batch
 from lap.verifiers.cover.data import make_sampler
 from lap.verifiers.cover.evaluator import compare_ablation
 from lap.verifiers.cover.evaluator import evaluate_embeddings
+from lap.verifiers.cover.evaluator import evaluate_explicit_best_checkpoint
+from lap.verifiers.cover.evaluator import load_fixed_best_checkpoint_logit_scale
+from lap.verifiers.cover.evaluator import require_explicit_best_checkpoint
 from lap.verifiers.cover.model import OpenClipSigLIP2Backbone
 from lap.verifiers.cover.model import TinyFrozenBackbone
 from lap.verifiers.cover.model import VerifierConfig
@@ -39,6 +42,26 @@ from lap.verifiers.cover.training import train_one_batch
 from lap.verifiers.cover.w3_contracts import canonical_bytes
 from lap.verifiers.cover.w3_contracts import content_hash
 from lap.verifiers.cover.w3_contracts import sha256_file
+
+
+def _verifier_config_from_dict(payload: dict[str, Any]) -> VerifierConfig:
+    allowed = {
+        "backbone_width",
+        "embedding_width",
+        "visual_tokens",
+        "num_heads",
+        "pooling_layers",
+        "trajectory_layers",
+        "feed_forward_width",
+        "history_length",
+        "action_width",
+        "use_wrist",
+        "text_aware_extraction_contract",
+        "trajectory_activation",
+        "trajectory_position_contract",
+        "attention_pooling_contract",
+    }
+    return VerifierConfig(**{key: payload[key] for key in allowed if key in payload})
 
 
 def train_model(
@@ -458,44 +481,57 @@ def run_train_mode(
     return train_receipt
 
 
-def run_evaluate_mode(*, checkpoint: Path, output_root: Path) -> dict[str, Any]:
-    """Consume one explicitly named fixed checkpoint and stage evaluation input."""
+def run_evaluate_mode(
+    *,
+    checkpoint: Path,
+    output_root: Path,
+    w2_root: Path,
+    protocol_dir: Path,
+    validator_path: Path | None = None,
+    device: torch.device | None = None,
+    model_factory: Any | None = None,
+) -> dict[str, Any]:
+    """Reload an explicit best checkpoint and emit canonical plus readable reports."""
 
-    checkpoint = Path(checkpoint)
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
-    try:
-        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    except Exception as error:  # pragma: no cover - torch-version-specific errors
-        raise ValueError("evaluation checkpoint is not a safe weights-only payload") from error
-    if not isinstance(payload, dict) or payload.get("schema") != "osx_cover_verifier_checkpoint_v1":
-        raise ValueError("evaluation requires an explicit W3 training checkpoint")
+    checkpoint = require_explicit_best_checkpoint(Path(checkpoint))
     output_root = Path(output_root)
     if output_root.exists():
         raise FileExistsError(output_root)
-    staging = output_root.parent / f".{output_root.name}.staging"
-    if staging.exists():
-        raise FileExistsError(staging)
-    staging.mkdir(parents=True)
-    try:
-        evaluation_receipt = {
-            "schema": "osx_cover_w3_evaluation_input_v1",
-            "mode": "evaluate",
-            "checkpoint": str(checkpoint),
-            "checkpoint_sha256": sha256_file(checkpoint),
-            "accepted": False,
-        }
-        (staging / "evaluation_input.json").write_bytes(canonical_bytes(evaluation_receipt) + b"\n")
-        staging.rename(output_root)
-    except Exception:
-        for path in sorted(staging.rglob("*"), reverse=True):
-            if path.is_file():
-                path.unlink()
-            elif path.is_dir():
-                path.rmdir()
-        staging.rmdir()
-        raise
-    return evaluation_receipt
+    protocol = validate_protocol_directory(Path(protocol_dir), require_complete=True)
+    dataset = W2DatasetGateway(Path(w2_root), validator_path=validator_path)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or "contract" not in payload:
+        raise ValueError("evaluation requires an explicit W3 training checkpoint")
+    contract = payload["contract"]
+    config = _verifier_config_from_dict(contract["model_config"])
+    if model_factory is not None:
+        model = model_factory(config)
+    elif contract.get("environment", {}).get("fixture"):
+        model = VerifierModel(
+            config,
+            TinyFrozenBackbone(width=config.backbone_width, tokens=config.visual_tokens),
+        )
+    else:
+        model = VerifierModel(config, OpenClipSigLIP2Backbone(pretrained="hf-hub:timm/ViT-L-16-SigLIP2-384"))
+    logit_scale = load_fixed_best_checkpoint_logit_scale(checkpoint, model)
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    preprocess = getattr(model.backbone, "preprocess", None)
+    dataset_kwargs = {} if preprocess is None else {"preprocess": preprocess}
+    validation_dataset = TwoViewDataset(dataset.validation, training=False, **dataset_kwargs)
+    batch_size = int(protocol["protocol"]["batch"]["per_rank"])
+    embeddings = collect_embeddings(model, validation_dataset, device=device, batch_size=batch_size)
+    return evaluate_explicit_best_checkpoint(
+        checkpoint=checkpoint,
+        protocol_dir=Path(protocol_dir),
+        output_root=output_root,
+        semantic_embeddings=embeddings["semantic"],
+        action_embeddings=embeddings["action"],
+        sample_ids=embeddings["sample_ids"],
+        episode_ids=embeddings["episode_ids"],
+        conditions=embeddings["conditions"],
+        checkpoint_logit_scale=logit_scale,
+    )
 
 
 def run_package_mode(*, evidence_root: Path, output_root: Path) -> dict[str, Any]:
