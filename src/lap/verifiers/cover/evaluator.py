@@ -290,6 +290,12 @@ def evaluate_embeddings(
             "ci95": clustered_percentile_interval(nearby_margin, nearby_episodes, bootstrap_indices),
         },
     }
+    metrics["pair_metrics"] = {
+        "aligned_minus_shuffled": shuffled_margin.tolist(),
+        "aligned_minus_shuffled_episode_ids": list(shuffled_episodes),
+        "aligned_minus_nearby": nearby_margin.tolist(),
+        "aligned_minus_nearby_episode_ids": list(nearby_episodes),
+    }
     condition_by_id = dict(zip(sample_ids, conditions, strict=True))
     for condition in sorted({(item["peg_shape"], item["approach_direction"]) for item in conditions}):
         mask = np.asarray([(item["peg_shape"], item["approach_direction"]) == condition for item in conditions])
@@ -488,6 +494,26 @@ def evaluate_explicit_best_checkpoint(
     return canonical
 
 
+def require_matched_ablation_identities(two_view: Mapping[str, Any], base_only: Mapping[str, Any]) -> None:
+    """Reject any mismatched matched-run / evaluation identity before comparison."""
+
+    required = (
+        "seed",
+        "sampler_seed",
+        "phrase_manifest_hash",
+        "optimizer",
+        "checkpoint_selection",
+        "evaluation",
+        "sample_ids",
+        "protocol_content_hash",
+    )
+    for key in required:
+        if key not in two_view or key not in base_only:
+            raise ValueError(f"matched ablation identity missing key: {key}")
+        if two_view[key] != base_only[key]:
+            raise ValueError(f"matched ablation identity mismatch: {key}")
+
+
 def compare_ablation(
     two_view: dict[str, Any], base_only: dict[str, Any], *, bootstrap_indices: np.ndarray | None = None
 ) -> dict[str, Any]:
@@ -519,7 +545,25 @@ def compare_ablation(
         if difference.shape != (two_view["pool"]["count"],):
             raise ValueError("ablation row metrics must cover the complete evaluation pool")
         paired_ci95[key] = clustered_percentile_interval(difference, two_rows["episode_ids"], two_bootstrap)
-    established = all(interval[0] > 0 for interval in paired_ci95.values())
+    two_pairs = two_view.get("pair_metrics", {})
+    base_pairs = base_only.get("pair_metrics", {})
+    for margin_key in ("aligned_minus_shuffled", "aligned_minus_nearby"):
+        if margin_key not in two_pairs or margin_key not in base_pairs:
+            raise ValueError("ablation reports must include paired margin metrics")
+        episode_key = f"{margin_key}_episode_ids"
+        if two_pairs.get(episode_key) != base_pairs.get(episode_key):
+            raise ValueError("ablation reports must use the same margin episode IDs")
+        two_margin = np.asarray(two_pairs[margin_key], dtype=np.float64)
+        base_margin = np.asarray(base_pairs[margin_key], dtype=np.float64)
+        if two_margin.shape != base_margin.shape:
+            raise ValueError("ablation margin pair metrics must align")
+        differences[margin_key] = float(
+            two_view["margins"][margin_key]["mean"] - base_only["margins"][margin_key]["mean"]
+        )
+        paired_ci95[margin_key] = clustered_percentile_interval(
+            two_margin - base_margin, two_pairs[episode_key], two_bootstrap
+        )
+    established = all(paired_ci95[key][0] > 0 for key in ("semantic_to_action_top1", "action_to_semantic_top1"))
     payload = {
         "schema": "osx_cover_w3_ablation_v1",
         "two_view_minus_base_only": differences,

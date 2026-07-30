@@ -481,25 +481,48 @@ def test_ablation_is_matched_and_states_wrist_benefit():
         "action_to_semantic_hit": [False] * 8,
     }
     bootstrap = build_bootstrap_indices(row_metrics["episode_ids"], replicates=4)
+    pair_metrics = {
+        "aligned_minus_shuffled": [0.0] * 8,
+        "aligned_minus_shuffled_episode_ids": row_metrics["episode_ids"],
+        "aligned_minus_nearby": [0.0] * 8,
+        "aligned_minus_nearby_episode_ids": row_metrics["episode_ids"],
+    }
     base = {
         "pool": {"count": 8},
         "retrieval": {"semantic_to_action_top1": 0.0, "action_to_semantic_top1": 0.0},
+        "margins": {
+            "aligned_minus_shuffled": {"mean": 0.0},
+            "aligned_minus_nearby": {"mean": 0.0},
+        },
         "row_metrics": row_metrics,
+        "pair_metrics": pair_metrics,
         "bootstrap_indices": bootstrap,
     }
     two = {
         "pool": {"count": 8},
         "retrieval": {"semantic_to_action_top1": 1.0, "action_to_semantic_top1": 1.0},
+        "margins": {
+            "aligned_minus_shuffled": {"mean": 1.0},
+            "aligned_minus_nearby": {"mean": 1.0},
+        },
         "row_metrics": {
             **row_metrics,
             "semantic_to_action_hit": [True] * 8,
             "action_to_semantic_hit": [True] * 8,
         },
+        "pair_metrics": {
+            "aligned_minus_shuffled": [1.0] * 8,
+            "aligned_minus_shuffled_episode_ids": row_metrics["episode_ids"],
+            "aligned_minus_nearby": [1.0] * 8,
+            "aligned_minus_nearby_episode_ids": row_metrics["episode_ids"],
+        },
         "bootstrap_indices": bootstrap,
     }
     result = compare_ablation(two, base)
     assert result["two_view_minus_base_only"]["semantic_to_action_top1"] == 1.0
+    assert result["two_view_minus_base_only"]["aligned_minus_shuffled"] == 1.0
     assert result["paired_ci95"]["semantic_to_action_top1"][0] > 0
+    assert result["paired_ci95"]["aligned_minus_shuffled"][0] > 0
     assert result["wrist_benefit_established"] is True
 
 
@@ -507,11 +530,21 @@ def test_ablation_rejects_mismatched_rows():
     report = {
         "pool": {"count": 1},
         "retrieval": {"semantic_to_action_top1": 1.0, "action_to_semantic_top1": 1.0},
+        "margins": {
+            "aligned_minus_shuffled": {"mean": 1.0},
+            "aligned_minus_nearby": {"mean": 1.0},
+        },
         "row_metrics": {
             "sample_ids": ["a"],
             "episode_ids": ["e"],
             "semantic_to_action_hit": [True],
             "action_to_semantic_hit": [True],
+        },
+        "pair_metrics": {
+            "aligned_minus_shuffled": [1.0],
+            "aligned_minus_shuffled_episode_ids": ["e"],
+            "aligned_minus_nearby": [1.0],
+            "aligned_minus_nearby_episode_ids": ["e"],
         },
         "bootstrap_indices": np.zeros((1, 1), dtype=np.int64),
     }

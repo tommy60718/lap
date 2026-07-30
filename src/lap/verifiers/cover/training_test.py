@@ -6,6 +6,7 @@ from lap.verifiers.cover.model import TinyFrozenBackbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
 from lap.verifiers.cover.protocol import RunProtocol
+from lap.verifiers.cover.training import base_only_config_delta
 from lap.verifiers.cover.training import create_optimizer
 from lap.verifiers.cover.training import make_base_only_config
 from lap.verifiers.cover.training import train_one_batch
@@ -66,3 +67,7 @@ def test_base_only_config_changes_only_wrist_fusion_contract():
     assert base.use_wrist is False
     assert base.fusion_input_width == 32
     assert base.action_width == two_view.action_width
+    delta = base_only_config_delta(two_view, base)
+    assert delta["use_wrist"]["base_only"] is False
+    assert delta["fusion_input_width"]["two_view"] == two_view.fusion_input_width
+    assert delta["fusion_input_width"]["base_only"] == base.fusion_input_width

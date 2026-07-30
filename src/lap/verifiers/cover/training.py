@@ -2,13 +2,25 @@
 
 from __future__ import annotations
 
+import random
 from typing import Any
 
+import numpy as np
 import torch
 
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
 from lap.verifiers.cover.protocol import RunProtocol
+
+
+def reset_approved_seed(seed: int) -> None:
+    """Reset Python/NumPy/Torch RNG before matched base-only construction."""
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def train_one_batch(
@@ -62,7 +74,38 @@ def make_base_only_config(config: VerifierConfig) -> VerifierConfig:
         history_length=config.history_length,
         action_width=config.action_width,
         use_wrist=False,
+        text_aware_extraction_contract=config.text_aware_extraction_contract,
+        trajectory_activation=config.trajectory_activation,
+        trajectory_position_contract=config.trajectory_position_contract,
+        attention_pooling_contract=config.attention_pooling_contract,
     )
+
+
+def base_only_config_delta(two_view: VerifierConfig, base_only: VerifierConfig) -> dict[str, Any]:
+    """Prove the controlled base-only difference is wrist omit + fresh fusion width."""
+
+    if two_view.use_wrist is not True:
+        raise ValueError("two-view config must enable wrist")
+    if base_only.use_wrist is not False:
+        raise ValueError("base-only config must omit wrist")
+    two_payload = two_view.to_dict()
+    base_payload = base_only.to_dict()
+    for key, value in two_payload.items():
+        if key == "use_wrist":
+            continue
+        if base_payload.get(key) != value:
+            raise ValueError(f"base-only config drifted on {key}")
+    expected_two = two_view.embedding_width * 3
+    expected_base = base_only.embedding_width * 2
+    if two_view.fusion_input_width != expected_two or base_only.fusion_input_width != expected_base:
+        raise ValueError("fusion widths drifted from the wrist/view contract")
+    return {
+        "use_wrist": {"two_view": True, "base_only": False},
+        "fusion_input_width": {
+            "two_view": two_view.fusion_input_width,
+            "base_only": base_only.fusion_input_width,
+        },
+    }
 
 
 def require_acceptance_metrics(report: dict[str, Any]) -> None:

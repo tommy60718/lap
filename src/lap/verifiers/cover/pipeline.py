@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import json
 from pathlib import Path
 from typing import Any
@@ -30,15 +31,18 @@ from lap.verifiers.cover.evaluator import evaluate_embeddings
 from lap.verifiers.cover.evaluator import evaluate_explicit_best_checkpoint
 from lap.verifiers.cover.evaluator import load_fixed_best_checkpoint_logit_scale
 from lap.verifiers.cover.evaluator import require_explicit_best_checkpoint
+from lap.verifiers.cover.evaluator import require_matched_ablation_identities
 from lap.verifiers.cover.model import OpenClipSigLIP2Backbone
 from lap.verifiers.cover.model import TinyFrozenBackbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
 from lap.verifiers.cover.protocol import RunProtocol
 from lap.verifiers.cover.protocol import validate_protocol_directory
+from lap.verifiers.cover.training import base_only_config_delta
 from lap.verifiers.cover.training import create_optimizer
 from lap.verifiers.cover.training import make_base_only_config
 from lap.verifiers.cover.training import require_acceptance_metrics
+from lap.verifiers.cover.training import reset_approved_seed
 from lap.verifiers.cover.training import train_one_batch
 from lap.verifiers.cover.w3_contracts import canonical_bytes
 from lap.verifiers.cover.w3_contracts import content_hash
@@ -229,6 +233,53 @@ def collect_embeddings(
     }
 
 
+def build_matched_ablation_identity(
+    *,
+    protocol: RunProtocol,
+    sample_ids: Sequence[str] | list[str],
+    phrase_manifest_hash: str,
+    protocol_content_hash: str,
+    evaluation_artifact_hashes: Mapping[str, str],
+) -> dict[str, Any]:
+    """Identity receipt proving matched rows/phrases/sampler/optimizer/selection/eval."""
+
+    return {
+        "seed": int(protocol.seed),
+        "sampler_seed": int(protocol.sampler_seed),
+        "phrase_manifest_hash": phrase_manifest_hash,
+        "optimizer": {
+            "name": "AdamW",
+            "learning_rate": float(protocol.learning_rate),
+            "betas": [float(protocol.betas[0]), float(protocol.betas[1])],
+            "epsilon": float(protocol.epsilon),
+            "weight_decay": float(protocol.weight_decay),
+            "warmup_epochs": int(protocol.warmup_epochs),
+            "epochs": int(protocol.epochs),
+        },
+        "checkpoint_selection": "lowest_validation_loss_earliest_epoch",
+        "evaluation": {
+            "shuffled_pairs_hash": evaluation_artifact_hashes["shuffled_pairs_hash"],
+            "nearby_pairs_hash": evaluation_artifact_hashes["nearby_pairs_hash"],
+            "bootstrap_indices_hash": evaluation_artifact_hashes["bootstrap_indices_hash"],
+        },
+        "sample_ids": list(sample_ids),
+        "protocol_content_hash": protocol_content_hash,
+    }
+
+
+def _evaluation_artifact_hashes(
+    *,
+    shuffled_pairs: list[dict[str, str]],
+    nearby_pairs: list[dict[str, str]],
+    bootstrap_indices: np.ndarray,
+) -> dict[str, str]:
+    return {
+        "shuffled_pairs_hash": content_hash({"pairs": shuffled_pairs}),
+        "nearby_pairs_hash": content_hash({"pairs": nearby_pairs}),
+        "bootstrap_indices_hash": content_hash(np.asarray(bootstrap_indices).tolist()),
+    }
+
+
 def run_matched_base_only(
     *,
     two_view_model: VerifierModel,
@@ -240,9 +291,15 @@ def run_matched_base_only(
     nearby_pairs: list[dict[str, str]],
     bootstrap_indices: np.ndarray,
     device: torch.device,
+    two_view_identity: Mapping[str, Any] | None = None,
+    phrase_manifest_hash: str = "",
+    protocol_content_hash: str = "",
 ) -> dict[str, Any]:
     """Train/evaluate the nondeployable wrist-omitting control on shared artifacts."""
-    base_model = VerifierModel(make_base_only_config(two_view_model.config), two_view_model.backbone)
+    reset_approved_seed(protocol.seed)
+    base_config = make_base_only_config(two_view_model.config)
+    config_delta = base_only_config_delta(two_view_model.config, base_config)
+    base_model = VerifierModel(base_config, two_view_model.backbone)
     apply_audited_initialization(base_model, Path(bridge_artifact), audit_manifest)
     preprocess = getattr(two_view_model.backbone, "preprocess", None)
     dataset_kwargs = {} if preprocess is None else {"preprocess": preprocess}
@@ -268,7 +325,72 @@ def run_matched_base_only(
     report["deployable"] = False
     report["training"] = training["history"]
     report["content_hash"] = content_hash({key: value for key, value in report.items() if key != "content_hash"})
-    return {"model": base_model, "training": training, "report": report}
+    identity = build_matched_ablation_identity(
+        protocol=protocol,
+        sample_ids=embeddings["sample_ids"],
+        phrase_manifest_hash=phrase_manifest_hash
+        or str(
+            getattr(dataset, "validation_receipt", {}).get("phrase_manifest_hash")
+            or (two_view_identity or {}).get("phrase_manifest_hash", "")
+        ),
+        protocol_content_hash=protocol_content_hash or str((two_view_identity or {}).get("protocol_content_hash", "")),
+        evaluation_artifact_hashes=_evaluation_artifact_hashes(
+            shuffled_pairs=shuffled_pairs,
+            nearby_pairs=nearby_pairs,
+            bootstrap_indices=bootstrap_indices,
+        ),
+    )
+    if two_view_identity is not None:
+        require_matched_ablation_identities(two_view_identity, identity)
+    return {
+        "model": base_model,
+        "training": training,
+        "report": report,
+        "identity": identity,
+        "config_delta": config_delta,
+    }
+
+
+def matched_base_only_run_to_paired_ablation_report(
+    *,
+    two_view_report: Mapping[str, Any],
+    two_view_identity: Mapping[str, Any],
+    base_only_result: Mapping[str, Any],
+    bootstrap_indices: np.ndarray,
+    output_root: Path,
+) -> dict[str, Any]:
+    """Public seam: matched base-only evidence → paired ablation report (never deployable)."""
+
+    require_matched_ablation_identities(two_view_identity, base_only_result["identity"])
+    base_report = base_only_result["report"]
+    if base_report.get("deployable") is not False or base_report.get("variant") != "base_only":
+        raise ValueError("base-only report must be explicitly nondeployable evidence")
+    if "config_delta" not in base_only_result:
+        raise ValueError("matched base-only result must include the controlled config delta")
+    ablation = compare_ablation(dict(two_view_report), dict(base_report), bootstrap_indices=bootstrap_indices)
+    payload = {
+        "schema": "osx_cover_w3_paired_ablation_report_v1",
+        "deployable": False,
+        "w5_eligible": False,
+        "accepted": False,
+        "variant": "base_only_evidence",
+        "config_delta": base_only_result["config_delta"],
+        "matched_identity": base_only_result["identity"],
+        "ablation": ablation,
+        "two_view_report_hash": two_view_report.get("content_hash"),
+        "base_only_report_hash": base_report.get("content_hash"),
+    }
+    payload["content_hash"] = content_hash(payload)
+    root = Path(output_root)
+    if root.exists():
+        raise FileExistsError(root)
+    root.mkdir(parents=True)
+    (root / "paired_ablation.json").write_bytes(canonical_bytes(payload) + b"\n")
+    (root / "EVIDENCE_ONLY_NONDEPLOYABLE").write_text(
+        "W3-08 matched base-only ablation evidence; not a W5 deployment candidate.\n",
+        encoding="utf-8",
+    )
+    return payload
 
 
 def run_fixture_end_to_end(*, output_root: Path) -> dict[str, Any]:
@@ -680,6 +802,16 @@ def run_canonical_acceptance(
             strict_protocol=True,
         )
         require_acceptance_metrics(report)
+        evaluation_hashes = _evaluation_artifact_hashes(
+            shuffled_pairs=shuffled, nearby_pairs=nearby, bootstrap_indices=bootstrap
+        )
+        two_view_identity = build_matched_ablation_identity(
+            protocol=protocol,
+            sample_ids=embeddings["sample_ids"],
+            phrase_manifest_hash=protocol_payload["identities"]["phrase_manifest_hash"],
+            protocol_content_hash=protocol_payload["content_hash"],
+            evaluation_artifact_hashes=evaluation_hashes,
+        )
         base_only = run_matched_base_only(
             two_view_model=model,
             bridge_artifact=Path(bridge_artifact),
@@ -690,9 +822,19 @@ def run_canonical_acceptance(
             nearby_pairs=nearby,
             bootstrap_indices=bootstrap,
             device=device,
+            two_view_identity=two_view_identity,
+            phrase_manifest_hash=protocol_payload["identities"]["phrase_manifest_hash"],
+            protocol_content_hash=protocol_payload["content_hash"],
         )
-        ablation = compare_ablation(report, base_only["report"], bootstrap_indices=bootstrap)
         (staging / "base_only").mkdir()
+        ablation_payload = matched_base_only_run_to_paired_ablation_report(
+            two_view_report=report,
+            two_view_identity=two_view_identity,
+            base_only_result=base_only,
+            bootstrap_indices=bootstrap,
+            output_root=staging / "base_only" / "paired_ablation",
+        )
+        ablation = ablation_payload["ablation"]
         save_training_checkpoint(
             staging / "base_only" / "latest.pt",
             model=base_only["model"],
