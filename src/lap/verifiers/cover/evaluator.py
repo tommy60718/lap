@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from lap.verifiers.cover.checkpoint import validate_best_checkpoint_for_evaluation
 from lap.verifiers.cover.protocol import SHUFFLED_COUNT
 from lap.verifiers.cover.protocol import VALIDATION_COUNT
 from lap.verifiers.cover.protocol import validate_protocol_directory
@@ -19,9 +20,38 @@ from lap.verifiers.cover.w3_contracts import sha256_file
 
 REQUIRED_CONDITION_KEYS = ("circular", "square")
 REQUIRED_DIRECTIONS = ("-x", "+x", "-y", "+y")
+_DIRECTION_FROM_EPISODE_TOKEN = {"negx": "-x", "posx": "+x", "negy": "-y", "posy": "+y"}
 CANONICAL_TIMING_FORBIDDEN_KEYS = frozenset(
     {"timestamp", "timestamps", "timing", "seconds", "elapsed", "started_at", "finished_at"}
 )
+
+
+def accepted_condition_rows(validation_semantics_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Bind each accepted validation sample to episode, peg shape, and approach direction."""
+
+    bound: list[dict[str, str]] = []
+    for row in validation_semantics_rows:
+        sample_id = str(row["sample_id"])
+        episode_id = str(row["episode_id"])
+        peg_shape = str(row["peg_shape"])
+        try:
+            token = episode_id.split("_")[1]
+            direction = _DIRECTION_FROM_EPISODE_TOKEN[token]
+        except (IndexError, KeyError) as error:
+            raise ValueError(f"accepted episode identity is not a D06 shape/direction episode: {episode_id}") from error
+        if peg_shape not in REQUIRED_CONDITION_KEYS:
+            raise ValueError(f"accepted peg_shape drifted: {peg_shape}")
+        if not sample_id.startswith(f"{peg_shape}_{token}_"):
+            raise ValueError(f"sample_id is not bound to accepted episode shape/direction: {sample_id}")
+        bound.append(
+            {
+                "sample_id": sample_id,
+                "episode_id": episode_id,
+                "peg_shape": peg_shape,
+                "approach_direction": direction,
+            }
+        )
+    return bound
 
 
 def _topk(logits: np.ndarray, k: int) -> float:
@@ -69,26 +99,53 @@ def require_explicit_best_checkpoint(checkpoint: Path) -> Path:
     return checkpoint
 
 
-def load_fixed_best_checkpoint_logit_scale(checkpoint: Path, model: torch.nn.Module) -> float:
+def load_fixed_best_checkpoint_logit_scale(
+    checkpoint: Path,
+    model: torch.nn.Module | None = None,
+    *,
+    expected_protocol_content_hash: str | None = None,
+    expected_train_manifest_hash: str | None = None,
+    expected_phrase_manifest_hash: str | None = None,
+) -> float:
     """Strictly load model weights from an explicit best checkpoint and return its logit scale."""
 
     checkpoint = require_explicit_best_checkpoint(checkpoint)
-    try:
-        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    except Exception as error:  # pragma: no cover - torch-version-specific errors
-        raise ValueError("evaluation checkpoint is not a loadable W3 payload") from error
-    if not isinstance(payload, dict) or payload.get("schema") != W3_CHECKPOINT_SCHEMA:
-        raise ValueError("evaluation requires an explicit W3 training checkpoint")
-    model_state = payload.get("model_state")
-    if not isinstance(model_state, dict):
-        raise ValueError("evaluation checkpoint missing model_state")
-    expected_keys = set(model.state_dict())
-    actual_keys = set(model_state)
-    if actual_keys != expected_keys:
-        raise ValueError("evaluation checkpoint model state keys mismatch")
-    model.load_state_dict(model_state, strict=True)
-    model.eval()
-    return float(model.logit_scale.detach().clamp(0.0, np.log(100.0)).exp())
+    if (
+        expected_protocol_content_hash is not None
+        and expected_train_manifest_hash is not None
+        and expected_phrase_manifest_hash is not None
+    ):
+        validated = validate_best_checkpoint_for_evaluation(
+            checkpoint,
+            expected_protocol_content_hash=expected_protocol_content_hash,
+            expected_train_manifest_hash=expected_train_manifest_hash,
+            expected_phrase_manifest_hash=expected_phrase_manifest_hash,
+            model=model,
+        )
+        model_state = validated["model_state"]
+    else:
+        try:
+            payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        except Exception as error:  # pragma: no cover - torch-version-specific errors
+            raise ValueError("evaluation checkpoint is not a loadable W3 payload") from error
+        if not isinstance(payload, dict) or payload.get("schema") != W3_CHECKPOINT_SCHEMA:
+            raise ValueError("evaluation requires an explicit W3 training checkpoint")
+        model_state = payload.get("model_state")
+        if not isinstance(model_state, dict):
+            raise ValueError("evaluation checkpoint missing model_state")
+        if "logit_scale" not in model_state:
+            raise ValueError("evaluation checkpoint missing logit_scale")
+        if model is not None:
+            expected_keys = set(model.state_dict())
+            actual_keys = set(model_state)
+            if actual_keys != expected_keys:
+                raise ValueError("evaluation checkpoint model state keys mismatch")
+    if model is not None:
+        model.load_state_dict(model_state, strict=True)
+        model.eval()
+        return float(model.logit_scale.detach().clamp(0.0, np.log(100.0)).exp())
+    logit = torch.as_tensor(model_state["logit_scale"], dtype=torch.float32)
+    return float(logit.detach().clamp(0.0, np.log(100.0)).exp())
 
 
 def evaluate_embeddings(
@@ -107,6 +164,7 @@ def evaluate_embeddings(
     expected_shuffled_pairs: Sequence[dict[str, str]] | None = None,
     expected_nearby_pairs: Sequence[dict[str, str]] | None = None,
     expected_bootstrap_indices: np.ndarray | None = None,
+    expected_condition_rows: Sequence[Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
     semantic = np.asarray(semantic_embeddings, dtype=np.float64)
     action = np.asarray(action_embeddings, dtype=np.float64)
@@ -127,6 +185,20 @@ def evaluate_embeddings(
         np.asarray(bootstrap_indices), np.asarray(expected_bootstrap_indices)
     ):
         raise ValueError("bootstrap artifact drifted from the accepted bootstrap identity")
+    if expected_condition_rows is not None:
+        if len(expected_condition_rows) != pool_count:
+            raise ValueError("accepted condition binding length drifted from the evaluation pool")
+        for index, (sample_id, episode_id, condition) in enumerate(
+            zip(sample_ids, episode_ids, conditions, strict=True)
+        ):
+            expected = expected_condition_rows[index]
+            if sample_id != expected["sample_id"] or episode_id != expected["episode_id"]:
+                raise ValueError("sample/episode binding drifted from the accepted condition rows")
+            if (
+                condition.get("peg_shape") != expected["peg_shape"]
+                or condition.get("approach_direction") != expected["approach_direction"]
+            ):
+                raise ValueError("condition binding drifted from the accepted sample condition")
 
     if strict_protocol:
         if (
@@ -325,7 +397,6 @@ def evaluate_explicit_best_checkpoint(
     sample_ids: Sequence[str],
     episode_ids: Sequence[str],
     conditions: Sequence[dict[str, str]],
-    checkpoint_logit_scale: float | None = None,
     model: torch.nn.Module | None = None,
     timing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -340,27 +411,15 @@ def evaluate_explicit_best_checkpoint(
     shuffled_pairs = protocol["shuffled_pairs"]["pairs"]
     nearby_pairs = protocol["nearby_pairs"]["pairs"]
     bootstrap_indices = protocol["bootstrap_indices"]
-    if model is not None:
-        scale = load_fixed_best_checkpoint_logit_scale(checkpoint, model)
-    elif checkpoint_logit_scale is None:
-        # Validate payload shape without requiring a live model when embeddings are supplied.
-        try:
-            payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        except Exception as error:  # pragma: no cover
-            raise ValueError("evaluation checkpoint is not a loadable W3 payload") from error
-        if not isinstance(payload, dict) or payload.get("schema") != W3_CHECKPOINT_SCHEMA:
-            raise ValueError("evaluation requires an explicit W3 training checkpoint")
-        if "model_state" not in payload:
-            raise ValueError("evaluation checkpoint missing model_state")
-        scale = 1.0
-    else:
-        scale = float(checkpoint_logit_scale)
-        try:
-            payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-        except Exception as error:  # pragma: no cover
-            raise ValueError("evaluation checkpoint is not a loadable W3 payload") from error
-        if not isinstance(payload, dict) or payload.get("schema") != W3_CHECKPOINT_SCHEMA:
-            raise ValueError("evaluation requires an explicit W3 training checkpoint")
+    protocol_payload = protocol["protocol"]
+    expected_condition_rows = accepted_condition_rows(protocol["validation_semantics"]["rows"])
+    scale = load_fixed_best_checkpoint_logit_scale(
+        checkpoint,
+        model,
+        expected_protocol_content_hash=str(protocol_payload["content_hash"]),
+        expected_train_manifest_hash=str(protocol_payload["identities"]["train_manifest_hash"]),
+        expected_phrase_manifest_hash=str(protocol_payload["identities"]["phrase_manifest_hash"]),
+    )
 
     metrics = evaluate_embeddings(
         semantic_embeddings,
@@ -371,12 +430,13 @@ def evaluate_explicit_best_checkpoint(
         shuffled_pairs=shuffled_pairs,
         nearby_pairs=nearby_pairs,
         bootstrap_indices=bootstrap_indices,
-        checkpoint_logit_scale=scale if checkpoint_logit_scale is None else float(checkpoint_logit_scale),
+        checkpoint_logit_scale=scale,
         strict_protocol=True,
         expected_sample_ids=expected_sample_ids,
         expected_shuffled_pairs=shuffled_pairs,
         expected_nearby_pairs=nearby_pairs,
         expected_bootstrap_indices=bootstrap_indices,
+        expected_condition_rows=expected_condition_rows,
     )
     staging = output_root.parent / f".{output_root.name}.staging"
     if staging.exists():
@@ -394,6 +454,7 @@ def evaluate_explicit_best_checkpoint(
                 "sha256": sha256_file(checkpoint),
                 "selection": "explicit_best",
             },
+            "checkpoint_logit_scale": scale,
             "protocol": {
                 "dir": str(Path(protocol_dir)),
                 "content_hash": protocol["protocol"]["content_hash"],

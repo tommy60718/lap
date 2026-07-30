@@ -18,6 +18,7 @@ from lap.verifiers.cover.checkpoint import capture_rng_state
 from lap.verifiers.cover.checkpoint import publish_deployment_bundle
 from lap.verifiers.cover.checkpoint import recorded_cuda_rng_device_count
 from lap.verifiers.cover.checkpoint import save_training_checkpoint
+from lap.verifiers.cover.checkpoint import validate_best_checkpoint_for_evaluation
 from lap.verifiers.cover.command import preflight_w3
 from lap.verifiers.cover.data import TwoViewDataset
 from lap.verifiers.cover.data import W2DatasetGateway
@@ -498,6 +499,13 @@ def run_evaluate_mode(
     if output_root.exists():
         raise FileExistsError(output_root)
     protocol = validate_protocol_directory(Path(protocol_dir), require_complete=True)
+    protocol_payload = protocol["protocol"]
+    validate_best_checkpoint_for_evaluation(
+        checkpoint,
+        expected_protocol_content_hash=str(protocol_payload["content_hash"]),
+        expected_train_manifest_hash=str(protocol_payload["identities"]["train_manifest_hash"]),
+        expected_phrase_manifest_hash=str(protocol_payload["identities"]["phrase_manifest_hash"]),
+    )
     dataset = W2DatasetGateway(Path(w2_root), validator_path=validator_path)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or "contract" not in payload:
@@ -513,7 +521,13 @@ def run_evaluate_mode(
         )
     else:
         model = VerifierModel(config, OpenClipSigLIP2Backbone(pretrained="hf-hub:timm/ViT-L-16-SigLIP2-384"))
-    logit_scale = load_fixed_best_checkpoint_logit_scale(checkpoint, model)
+    load_fixed_best_checkpoint_logit_scale(
+        checkpoint,
+        model,
+        expected_protocol_content_hash=str(protocol_payload["content_hash"]),
+        expected_train_manifest_hash=str(protocol_payload["identities"]["train_manifest_hash"]),
+        expected_phrase_manifest_hash=str(protocol_payload["identities"]["phrase_manifest_hash"]),
+    )
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     preprocess = getattr(model.backbone, "preprocess", None)
@@ -530,7 +544,7 @@ def run_evaluate_mode(
         sample_ids=embeddings["sample_ids"],
         episode_ids=embeddings["episode_ids"],
         conditions=embeddings["conditions"],
-        checkpoint_logit_scale=logit_scale,
+        model=model,
     )
 
 

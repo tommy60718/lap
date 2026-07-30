@@ -20,6 +20,7 @@ from lap.verifiers.cover.checkpoint import load_training_checkpoint
 from lap.verifiers.cover.checkpoint import publish_deployment_bundle
 from lap.verifiers.cover.checkpoint import save_training_checkpoint
 from lap.verifiers.cover.checkpoint import select_best_checkpoint
+from lap.verifiers.cover.checkpoint import validate_best_checkpoint_for_evaluation
 from lap.verifiers.cover.data import preprocess_rgb
 from lap.verifiers.cover.model import TinyFrozenBackbone
 from lap.verifiers.cover.model import VerifierConfig
@@ -892,3 +893,52 @@ def test_real_two_gpu_checkpoint_resumes_exactly(tmp_path):
     for key in ("semantic", "action", "logits"):
         torch.testing.assert_close(after[key], before[key], atol=0.0, rtol=0.0)
     assert after["loss"] == before["loss"]
+
+
+def test_validate_best_checkpoint_for_evaluation_binds_protocol_and_w2_identities(tmp_path):
+    model = _model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    contract = _contract()
+    path = tmp_path / "best.pt"
+    save_training_checkpoint(
+        path,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        progress=_progress(),
+        contract=contract,
+        sampler_state={"epoch": 1, "rank": 0, "world_size": 1},
+        rank=0,
+    )
+    validated = validate_best_checkpoint_for_evaluation(
+        path,
+        expected_protocol_content_hash="d" * 64,
+        expected_train_manifest_hash="e" * 64,
+        expected_phrase_manifest_hash="f" * 64,
+        model=model,
+    )
+    assert validated["contract"]["w3_03_protocol"]["protocol_content_hash"] == "d" * 64
+    with pytest.raises(ValueError, match="protocol identity"):
+        validate_best_checkpoint_for_evaluation(
+            path,
+            expected_protocol_content_hash="9" * 64,
+            expected_train_manifest_hash="e" * 64,
+            expected_phrase_manifest_hash="f" * 64,
+        )
+    with pytest.raises(ValueError, match="train-manifest"):
+        validate_best_checkpoint_for_evaluation(
+            path,
+            expected_protocol_content_hash="d" * 64,
+            expected_train_manifest_hash="0" * 64,
+            expected_phrase_manifest_hash="f" * 64,
+        )
+    latest = tmp_path / "latest.pt"
+    latest.write_bytes(path.read_bytes())
+    with pytest.raises(ValueError, match=r"best\.pt"):
+        validate_best_checkpoint_for_evaluation(
+            latest,
+            expected_protocol_content_hash="d" * 64,
+            expected_train_manifest_hash="e" * 64,
+            expected_phrase_manifest_hash="f" * 64,
+        )

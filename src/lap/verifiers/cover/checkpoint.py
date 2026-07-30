@@ -489,6 +489,54 @@ def _load_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
+def validate_best_checkpoint_for_evaluation(
+    path: Path,
+    *,
+    expected_protocol_content_hash: str,
+    expected_train_manifest_hash: str,
+    expected_phrase_manifest_hash: str,
+    model: torch.nn.Module | None = None,
+) -> dict[str, Any]:
+    """Validate an explicit best.pt against accepted W3-03/W2 identities before scoring.
+
+    This is the authoritative evaluation-load compatibility gate consumed by W3-07.
+    It never mutates the caller model unless ``model`` is provided for optional key
+    validation only (still no state restore).
+    """
+
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if path.name != "best.pt":
+        raise ValueError("evaluation requires an explicitly named best.pt checkpoint")
+    payload = _load_payload(path)
+    if payload.get("schema") != W3_CHECKPOINT_SCHEMA:
+        raise ValueError("evaluation requires an explicit W3 training checkpoint")
+    contract = _validate_contract(_require_mapping(payload.get("contract"), name="contract"))
+    protocol = contract["w3_03_protocol"]
+    if protocol.get("protocol_content_hash") != expected_protocol_content_hash:
+        raise ValueError("checkpoint protocol identity mismatch against accepted W3-03 protocol hash")
+    w2 = _require_mapping(contract.get("w2_identities"), name="w2_identities")
+    if w2.get("train_manifest_hash") != expected_train_manifest_hash:
+        raise ValueError("checkpoint W2 train-manifest identity mismatch")
+    if w2.get("phrase_manifest_hash") != expected_phrase_manifest_hash:
+        raise ValueError("checkpoint W2 phrase-manifest identity mismatch")
+    model_state = _require_mapping(payload.get("model_state"), name="model_state")
+    if "logit_scale" not in model_state:
+        raise ValueError("evaluation checkpoint missing logit_scale")
+    if model is not None:
+        expected_keys = set(model.state_dict())
+        actual_keys = set(model_state)
+        if actual_keys != expected_keys:
+            raise ValueError("evaluation checkpoint model state keys mismatch")
+    return {
+        "path": path,
+        "payload": payload,
+        "contract": contract,
+        "model_state": model_state,
+    }
+
+
 def _validate_training_payload(
     payload: Mapping[str, Any], *, expected_contract: Mapping[str, Any], model: torch.nn.Module, rank: int
 ) -> dict[str, Any]:

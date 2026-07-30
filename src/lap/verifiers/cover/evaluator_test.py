@@ -25,6 +25,11 @@ from lap.verifiers.cover.w3_contracts import canonical_bytes
 from lap.verifiers.cover.w3_contracts import content_hash
 
 PROTOCOL_DIR = Path(__file__).resolve().parents[4] / "artifacts" / "w3" / "protocol"
+ACCEPTED_PROTOCOL = json.loads((PROTOCOL_DIR / "run_protocol.json").read_text(encoding="utf-8"))
+ACCEPTED_PROTOCOL_HASH = ACCEPTED_PROTOCOL["content_hash"]
+ACCEPTED_TRAIN_MANIFEST_HASH = ACCEPTED_PROTOCOL["identities"]["train_manifest_hash"]
+ACCEPTED_PHRASE_MANIFEST_HASH = ACCEPTED_PROTOCOL["identities"]["phrase_manifest_hash"]
+STORED_LOGIT_SCALE = 14.284855842590332
 
 
 def _tiny_model():
@@ -42,21 +47,32 @@ def _tiny_model():
     )
 
 
-def _save_best(tmp_path: Path, *, name: str = "best.pt") -> Path:
+def _save_best(
+    tmp_path: Path,
+    *,
+    name: str = "best.pt",
+    logit_scale: float | None = None,
+    protocol_content_hash: str = ACCEPTED_PROTOCOL_HASH,
+    train_manifest_hash: str = ACCEPTED_TRAIN_MANIFEST_HASH,
+    phrase_manifest_hash: str = ACCEPTED_PHRASE_MANIFEST_HASH,
+) -> Path:
     model = _tiny_model()
+    if logit_scale is not None:
+        with torch.no_grad():
+            model.logit_scale.fill_(float(np.log(logit_scale)))
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
     contract = build_checkpoint_contract(
         audit_manifest_sha256="a" * 64,
         bridge_artifact_sha256="b" * 64,
         target_fingerprint="c" * 64,
-        protocol_content_hash="d" * 64,
+        protocol_content_hash=protocol_content_hash,
         protocol_version="w3-g02-accepted-run-v1",
         model_config=model.config.to_dict(),
         four_state_inventory=build_four_state_inventory(),
         w2_identities={
-            "train_manifest_hash": "e" * 64,
-            "phrase_manifest_hash": "f" * 64,
+            "train_manifest_hash": train_manifest_hash,
+            "phrase_manifest_hash": phrase_manifest_hash,
             "normalization_artifact_hash": "1" * 64,
         },
         environment={"torch": torch.__version__, "cuda_rng_device_count": 0, "fixture": True},
@@ -173,6 +189,98 @@ def test_explicit_best_checkpoint_seam_rejects_latest_and_writes_canonical_and_r
     assert "1.25" in readable or "seconds" in readable.lower()
     assert first["content_hash"] == second["content_hash"]
     assert first["accepted"] is False
+
+
+def test_w3_07_r1_public_seam_margins_use_only_checkpoint_logit_scale(tmp_path):
+    best = _save_best(tmp_path, logit_scale=STORED_LOGIT_SCALE)
+    pool = _canonical_pool_inputs()
+    out = tmp_path / "r1-out"
+    # No live model and no caller scale: the seam must still use best.pt.
+    report = evaluate_explicit_best_checkpoint(
+        checkpoint=best,
+        protocol_dir=PROTOCOL_DIR,
+        output_root=out,
+        semantic_embeddings=pool["semantic_embeddings"],
+        action_embeddings=pool["action_embeddings"],
+        sample_ids=pool["sample_ids"],
+        episode_ids=pool["episode_ids"],
+        conditions=pool["conditions"],
+    )
+    assert report["margins"]["aligned_minus_shuffled"]["mean"] == pytest.approx(STORED_LOGIT_SCALE)
+    assert report["margins"]["aligned_minus_nearby"]["mean"] == pytest.approx(STORED_LOGIT_SCALE)
+    assert report["checkpoint_logit_scale"] == pytest.approx(STORED_LOGIT_SCALE)
+
+    with pytest.raises((TypeError, ValueError), match=r"checkpoint_logit_scale|substitute|caller"):
+        evaluate_explicit_best_checkpoint(
+            checkpoint=best,
+            protocol_dir=PROTOCOL_DIR,
+            output_root=tmp_path / "r1-override",
+            semantic_embeddings=pool["semantic_embeddings"],
+            action_embeddings=pool["action_embeddings"],
+            sample_ids=pool["sample_ids"],
+            episode_ids=pool["episode_ids"],
+            conditions=pool["conditions"],
+            checkpoint_logit_scale=1.0,
+        )
+
+
+def test_w3_07_r2_rejects_protocol_or_w2_identity_mismatch_before_output(tmp_path):
+    pool = _canonical_pool_inputs()
+    bad_protocol = _save_best(tmp_path / "proto", protocol_content_hash="d" * 64)
+    out_protocol = tmp_path / "r2-protocol"
+    with pytest.raises(ValueError, match=r"protocol.*(hash|identity|mismatch|compat)"):
+        evaluate_explicit_best_checkpoint(
+            checkpoint=bad_protocol,
+            protocol_dir=PROTOCOL_DIR,
+            output_root=out_protocol,
+            semantic_embeddings=pool["semantic_embeddings"],
+            action_embeddings=pool["action_embeddings"],
+            sample_ids=pool["sample_ids"],
+            episode_ids=pool["episode_ids"],
+            conditions=pool["conditions"],
+        )
+    assert not out_protocol.exists()
+
+    bad_w2 = _save_best(tmp_path / "w2", train_manifest_hash="e" * 64)
+    out_w2 = tmp_path / "r2-w2"
+    with pytest.raises(ValueError, match=r"w2|train.manifest|identity|compat"):
+        evaluate_explicit_best_checkpoint(
+            checkpoint=bad_w2,
+            protocol_dir=PROTOCOL_DIR,
+            output_root=out_w2,
+            semantic_embeddings=pool["semantic_embeddings"],
+            action_embeddings=pool["action_embeddings"],
+            sample_ids=pool["sample_ids"],
+            episode_ids=pool["episode_ids"],
+            conditions=pool["conditions"],
+        )
+    assert not out_w2.exists()
+
+
+def test_w3_07_r3_rejects_set_preserving_per_row_condition_permutation(tmp_path):
+    best = _save_best(tmp_path, logit_scale=STORED_LOGIT_SCALE)
+    pool = _canonical_pool_inputs()
+    directions = ["-x", "+x", "-y", "+y"]
+    drifted = []
+    for condition in pool["conditions"]:
+        nxt = directions[(directions.index(condition["approach_direction"]) + 1) % 4]
+        drifted.append({"peg_shape": condition["peg_shape"], "approach_direction": nxt})
+    assert {(c["peg_shape"], c["approach_direction"]) for c in drifted} == {
+        (shape, direction) for shape in ("circular", "square") for direction in directions
+    }
+    out = tmp_path / "r3-out"
+    with pytest.raises(ValueError, match=r"condition.*(bind|drift|sample|accepted)"):
+        evaluate_explicit_best_checkpoint(
+            checkpoint=best,
+            protocol_dir=PROTOCOL_DIR,
+            output_root=out,
+            semantic_embeddings=pool["semantic_embeddings"],
+            action_embeddings=pool["action_embeddings"],
+            sample_ids=pool["sample_ids"],
+            episode_ids=pool["episode_ids"],
+            conditions=drifted,
+        )
+    assert not out.exists()
 
 
 def test_evaluator_reports_full_pool_retrieval_margins_conditions_and_hash():

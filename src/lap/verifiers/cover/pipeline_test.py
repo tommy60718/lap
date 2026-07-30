@@ -38,12 +38,23 @@ def test_run_evaluate_mode_reloads_best_and_delegates_to_public_seam(tmp_path, m
     monkeypatch.setattr(
         "lap.verifiers.cover.pipeline.validate_protocol_directory",
         lambda *args, **kwargs: {
-            "protocol": {"batch": {"per_rank": 16}, "content_hash": "p" * 64},
+            "protocol": {
+                "batch": {"per_rank": 16},
+                "content_hash": "p" * 64,
+                "identities": {
+                    "train_manifest_hash": "t" * 64,
+                    "phrase_manifest_hash": "h" * 64,
+                },
+            },
             "validation_semantics": {"rows": []},
             "shuffled_pairs": {"pairs": []},
             "nearby_pairs": {"pairs": []},
             "bootstrap_indices": None,
         },
+    )
+    monkeypatch.setattr(
+        "lap.verifiers.cover.pipeline.validate_best_checkpoint_for_evaluation",
+        lambda *args, **kwargs: {"contract": {"model_config": {}, "environment": {"fixture": True}}},
     )
     monkeypatch.setattr(
         "lap.verifiers.cover.pipeline.W2DatasetGateway",
@@ -83,7 +94,7 @@ def test_run_evaluate_mode_reloads_best_and_delegates_to_public_seam(tmp_path, m
     monkeypatch.setattr("lap.verifiers.cover.pipeline.TinyFrozenBackbone", lambda **kwargs: object())
     monkeypatch.setattr(
         "lap.verifiers.cover.pipeline.load_fixed_best_checkpoint_logit_scale",
-        lambda checkpoint, model: 2.5,
+        lambda checkpoint, model=None, **kwargs: 2.5,
     )
     monkeypatch.setattr(
         "lap.verifiers.cover.pipeline.TwoViewDataset",
@@ -134,6 +145,6 @@ def test_run_evaluate_mode_reloads_best_and_delegates_to_public_seam(tmp_path, m
     assert report["accepted"] is False
     assert report["mode"] == "evaluate"
     assert Path(observed["checkpoint"]) == best
-    assert observed["checkpoint_logit_scale"] == 2.5
+    assert "checkpoint_logit_scale" not in observed
     assert (out / "evaluation.json").is_file()
     assert (out / "evaluation_report.txt").is_file()
