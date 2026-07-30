@@ -108,6 +108,33 @@ def base_only_config_delta(two_view: VerifierConfig, base_only: VerifierConfig) 
     }
 
 
+def require_permitted_config_delta(config_delta: Any) -> dict[str, Any]:
+    """Reject forged/extra/inconsistent ablation config deltas before any output."""
+
+    if not isinstance(config_delta, dict):
+        raise ValueError("config delta must be a mapping")
+    allowed = {"use_wrist", "fusion_input_width"}
+    keys = set(config_delta)
+    if keys != allowed:
+        raise ValueError(f"config delta must contain exactly wrist omission and fresh fusion width; got {sorted(keys)}")
+    wrist = config_delta["use_wrist"]
+    if wrist != {"two_view": True, "base_only": False}:
+        raise ValueError("config delta use_wrist must be two_view=True, base_only=False")
+    fusion = config_delta["fusion_input_width"]
+    if not isinstance(fusion, dict) or set(fusion) != {"two_view", "base_only"}:
+        raise ValueError("config delta fusion_input_width is incomplete")
+    two = fusion["two_view"]
+    base = fusion["base_only"]
+    if type(two) is not int or type(base) is not int:
+        raise ValueError("fusion widths must be integers")
+    if two <= 0 or base <= 0 or two % 3 != 0 or base != (two // 3) * 2:
+        raise ValueError("fusion widths drifted from the wrist/view contract")
+    return {
+        "use_wrist": {"two_view": True, "base_only": False},
+        "fusion_input_width": {"two_view": two, "base_only": base},
+    }
+
+
 def require_acceptance_metrics(report: dict[str, Any]) -> None:
     retrieval = report["retrieval"]
     chance = report["pool"]["top1_chance"]

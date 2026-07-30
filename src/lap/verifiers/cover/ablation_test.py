@@ -13,6 +13,7 @@ from lap.verifiers.cover.evaluator import compare_ablation
 from lap.verifiers.cover.model import TinyFrozenBackbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
+from lap.verifiers.cover.pipeline import bootstrap_indices_content_hash
 from lap.verifiers.cover.pipeline import build_matched_ablation_identity
 from lap.verifiers.cover.pipeline import matched_base_only_run_to_paired_ablation_report
 from lap.verifiers.cover.pipeline import run_matched_base_only
@@ -23,7 +24,14 @@ from lap.verifiers.cover.training import make_base_only_config
 from lap.verifiers.cover.training import reset_approved_seed
 
 
-def _identity(**overrides):
+def _permitted_delta():
+    return {
+        "use_wrist": {"two_view": True, "base_only": False},
+        "fusion_input_width": {"two_view": 48, "base_only": 32},
+    }
+
+
+def _identity(bootstrap, **overrides):
     payload = {
         "seed": 42,
         "sampler_seed": 42,
@@ -41,7 +49,7 @@ def _identity(**overrides):
         "evaluation": {
             "shuffled_pairs_hash": "s" * 64,
             "nearby_pairs_hash": "n" * 64,
-            "bootstrap_indices_hash": "b" * 64,
+            "bootstrap_indices_hash": bootstrap_indices_content_hash(bootstrap),
         },
         "sample_ids": [f"sample-{i}" for i in range(8)],
         "protocol_content_hash": "c" * 64,
@@ -149,8 +157,8 @@ def test_reset_approved_seed_restores_torch_rng():
 
 def test_public_seam_rejects_mismatched_run_identity(tmp_path):
     two, base, bootstrap = _reports()
-    two_identity = _identity()
-    base_identity = _identity(sample_ids=[f"other-{i}" for i in range(8)])
+    two_identity = _identity(bootstrap)
+    base_identity = _identity(bootstrap, sample_ids=[f"other-{i}" for i in range(8)])
     with pytest.raises(ValueError, match="identity mismatch"):
         matched_base_only_run_to_paired_ablation_report(
             two_view_report=two,
@@ -158,20 +166,18 @@ def test_public_seam_rejects_mismatched_run_identity(tmp_path):
             base_only_result={
                 "report": base,
                 "identity": base_identity,
-                "config_delta": {
-                    "use_wrist": {"two_view": True, "base_only": False},
-                    "fusion_input_width": {"two_view": 48, "base_only": 32},
-                },
+                "config_delta": _permitted_delta(),
             },
             bootstrap_indices=bootstrap,
             output_root=tmp_path / "ablation",
         )
+    assert not (tmp_path / "ablation" / "paired_ablation.json").exists()
 
 
 def test_public_seam_rejects_mismatched_evaluation_artifact_hash(tmp_path):
     two, base, bootstrap = _reports()
-    two_identity = _identity()
-    base_identity = _identity(evaluation={**two_identity["evaluation"], "bootstrap_indices_hash": "x" * 64})
+    two_identity = _identity(bootstrap)
+    base_identity = _identity(bootstrap, evaluation={**two_identity["evaluation"], "bootstrap_indices_hash": "x" * 64})
     with pytest.raises(ValueError, match="identity mismatch"):
         matched_base_only_run_to_paired_ablation_report(
             two_view_report=two,
@@ -179,14 +185,78 @@ def test_public_seam_rejects_mismatched_evaluation_artifact_hash(tmp_path):
             base_only_result={
                 "report": base,
                 "identity": base_identity,
-                "config_delta": {
-                    "use_wrist": {"two_view": True, "base_only": False},
-                    "fusion_input_width": {"two_view": 48, "base_only": 32},
-                },
+                "config_delta": _permitted_delta(),
             },
             bootstrap_indices=bootstrap,
             output_root=tmp_path / "ablation",
         )
+    assert not (tmp_path / "ablation" / "paired_ablation.json").exists()
+
+
+def test_w3_08_r1_public_seam_rejects_forged_config_delta_without_output(tmp_path):
+    two, base, bootstrap = _reports()
+    identity = _identity(bootstrap)
+    forged = {
+        **_permitted_delta(),
+        "learning_rate": {"two_view": 1e-6, "base_only": 1e-5},
+    }
+    with pytest.raises(ValueError, match="exactly wrist omission and fresh fusion width"):
+        matched_base_only_run_to_paired_ablation_report(
+            two_view_report=two,
+            two_view_identity=identity,
+            base_only_result={
+                "report": base,
+                "identity": identity,
+                "config_delta": forged,
+            },
+            bootstrap_indices=bootstrap,
+            output_root=tmp_path / "ablation-r1",
+        )
+    assert not (tmp_path / "ablation-r1").exists()
+    assert not (tmp_path / "ablation-r1" / "paired_ablation.json").exists()
+
+
+def test_w3_08_r1_public_seam_rejects_inconsistent_fusion_width_without_output(tmp_path):
+    two, base, bootstrap = _reports()
+    identity = _identity(bootstrap)
+    inconsistent = {
+        "use_wrist": {"two_view": True, "base_only": False},
+        "fusion_input_width": {"two_view": 48, "base_only": 48},
+    }
+    with pytest.raises(ValueError, match="fusion widths"):
+        matched_base_only_run_to_paired_ablation_report(
+            two_view_report=two,
+            two_view_identity=identity,
+            base_only_result={
+                "report": base,
+                "identity": identity,
+                "config_delta": inconsistent,
+            },
+            bootstrap_indices=bootstrap,
+            output_root=tmp_path / "ablation-r1-fusion",
+        )
+    assert not (tmp_path / "ablation-r1-fusion").exists()
+
+
+def test_w3_08_r2_public_seam_rejects_substituted_bootstrap_without_output(tmp_path):
+    two, base, bootstrap = _reports()
+    identity = _identity(bootstrap)
+    substituted = np.zeros_like(bootstrap)
+    assert not np.array_equal(substituted, bootstrap)
+    with pytest.raises(ValueError, match=r"bootstrap .*matched evaluation identity"):
+        matched_base_only_run_to_paired_ablation_report(
+            two_view_report=two,
+            two_view_identity=identity,
+            base_only_result={
+                "report": base,
+                "identity": identity,
+                "config_delta": _permitted_delta(),
+            },
+            bootstrap_indices=substituted,
+            output_root=tmp_path / "ablation-r2",
+        )
+    assert not (tmp_path / "ablation-r2").exists()
+    assert not (tmp_path / "ablation-r2" / "paired_ablation.json").exists()
 
 
 def test_compare_ablation_reports_paired_retrieval_and_margin_intervals():
@@ -212,7 +282,7 @@ def test_compare_ablation_reports_zero_containing_interval_honestly():
 
 def test_public_seam_writes_nondeployable_paired_evidence_and_w5_rejects(tmp_path):
     two, base, bootstrap = _reports()
-    identity = _identity()
+    identity = _identity(bootstrap)
     output_root = tmp_path / "ablation"
     payload = matched_base_only_run_to_paired_ablation_report(
         two_view_report=two,
@@ -220,10 +290,7 @@ def test_public_seam_writes_nondeployable_paired_evidence_and_w5_rejects(tmp_pat
         base_only_result={
             "report": base,
             "identity": identity,
-            "config_delta": {
-                "use_wrist": {"two_view": True, "base_only": False},
-                "fusion_input_width": {"two_view": 48, "base_only": 32},
-            },
+            "config_delta": _permitted_delta(),
         },
         bootstrap_indices=bootstrap,
         output_root=output_root,
@@ -294,27 +361,26 @@ def test_run_matched_base_only_resets_seed_before_construction(monkeypatch):
 
 def test_build_matched_ablation_identity_is_stable():
     protocol = RunProtocol()
+    bootstrap = np.arange(8, dtype=np.int64).reshape(1, 8)
+    hashes = {
+        "shuffled_pairs_hash": "s" * 64,
+        "nearby_pairs_hash": "n" * 64,
+        "bootstrap_indices_hash": bootstrap_indices_content_hash(bootstrap),
+    }
     first = build_matched_ablation_identity(
         protocol=protocol,
         sample_ids=["a", "b"],
         phrase_manifest_hash="p" * 64,
         protocol_content_hash="c" * 64,
-        evaluation_artifact_hashes={
-            "shuffled_pairs_hash": "s" * 64,
-            "nearby_pairs_hash": "n" * 64,
-            "bootstrap_indices_hash": "b" * 64,
-        },
+        evaluation_artifact_hashes=hashes,
     )
     second = build_matched_ablation_identity(
         protocol=protocol,
         sample_ids=["a", "b"],
         phrase_manifest_hash="p" * 64,
         protocol_content_hash="c" * 64,
-        evaluation_artifact_hashes={
-            "shuffled_pairs_hash": "s" * 64,
-            "nearby_pairs_hash": "n" * 64,
-            "bootstrap_indices_hash": "b" * 64,
-        },
+        evaluation_artifact_hashes=hashes,
     )
     assert first == second
     assert first["checkpoint_selection"] == "lowest_validation_loss_earliest_epoch"
+    assert first["evaluation"]["bootstrap_indices_hash"] == bootstrap_indices_content_hash(bootstrap)

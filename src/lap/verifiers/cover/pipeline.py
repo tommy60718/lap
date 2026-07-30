@@ -42,6 +42,7 @@ from lap.verifiers.cover.training import base_only_config_delta
 from lap.verifiers.cover.training import create_optimizer
 from lap.verifiers.cover.training import make_base_only_config
 from lap.verifiers.cover.training import require_acceptance_metrics
+from lap.verifiers.cover.training import require_permitted_config_delta
 from lap.verifiers.cover.training import reset_approved_seed
 from lap.verifiers.cover.training import train_one_batch
 from lap.verifiers.cover.w3_contracts import canonical_bytes
@@ -267,6 +268,23 @@ def build_matched_ablation_identity(
     }
 
 
+def bootstrap_indices_content_hash(bootstrap_indices: np.ndarray | list[Any]) -> str:
+    """Content identity for bootstrap arrays bound into matched ablation receipts."""
+
+    return content_hash({"bootstrap_indices": np.asarray(bootstrap_indices).tolist()})
+
+
+def require_bootstrap_matches_matched_identity(bootstrap_indices: np.ndarray, identity: Mapping[str, Any]) -> None:
+    """Reject substituted/mutated bootstrap content before comparison or output."""
+
+    evaluation = identity.get("evaluation")
+    if not isinstance(evaluation, Mapping) or "bootstrap_indices_hash" not in evaluation:
+        raise ValueError("matched ablation identity missing bootstrap_indices_hash")
+    actual = bootstrap_indices_content_hash(bootstrap_indices)
+    if actual != evaluation["bootstrap_indices_hash"]:
+        raise ValueError("bootstrap indices drifted from matched evaluation identity")
+
+
 def _evaluation_artifact_hashes(
     *,
     shuffled_pairs: list[dict[str, str]],
@@ -276,7 +294,7 @@ def _evaluation_artifact_hashes(
     return {
         "shuffled_pairs_hash": content_hash({"pairs": shuffled_pairs}),
         "nearby_pairs_hash": content_hash({"pairs": nearby_pairs}),
-        "bootstrap_indices_hash": content_hash(np.asarray(bootstrap_indices).tolist()),
+        "bootstrap_indices_hash": bootstrap_indices_content_hash(bootstrap_indices),
     }
 
 
@@ -362,11 +380,14 @@ def matched_base_only_run_to_paired_ablation_report(
     """Public seam: matched base-only evidence → paired ablation report (never deployable)."""
 
     require_matched_ablation_identities(two_view_identity, base_only_result["identity"])
+    require_bootstrap_matches_matched_identity(bootstrap_indices, two_view_identity)
+    require_bootstrap_matches_matched_identity(bootstrap_indices, base_only_result["identity"])
     base_report = base_only_result["report"]
     if base_report.get("deployable") is not False or base_report.get("variant") != "base_only":
         raise ValueError("base-only report must be explicitly nondeployable evidence")
     if "config_delta" not in base_only_result:
         raise ValueError("matched base-only result must include the controlled config delta")
+    config_delta = require_permitted_config_delta(base_only_result["config_delta"])
     ablation = compare_ablation(dict(two_view_report), dict(base_report), bootstrap_indices=bootstrap_indices)
     payload = {
         "schema": "osx_cover_w3_paired_ablation_report_v1",
@@ -374,7 +395,7 @@ def matched_base_only_run_to_paired_ablation_report(
         "w5_eligible": False,
         "accepted": False,
         "variant": "base_only_evidence",
-        "config_delta": base_only_result["config_delta"],
+        "config_delta": config_delta,
         "matched_identity": base_only_result["identity"],
         "ablation": ablation,
         "two_view_report_hash": two_view_report.get("content_hash"),
