@@ -373,6 +373,7 @@ def matched_base_only_run_to_paired_ablation_report(
     *,
     two_view_report: Mapping[str, Any],
     two_view_identity: Mapping[str, Any],
+    two_view_config: VerifierConfig | Mapping[str, Any] | VerifierModel,
     base_only_result: Mapping[str, Any],
     bootstrap_indices: np.ndarray,
     output_root: Path,
@@ -387,7 +388,12 @@ def matched_base_only_run_to_paired_ablation_report(
         raise ValueError("base-only report must be explicitly nondeployable evidence")
     if "config_delta" not in base_only_result:
         raise ValueError("matched base-only result must include the controlled config delta")
-    config_delta = require_permitted_config_delta(base_only_result["config_delta"])
+    two_view = _resolve_ablation_verifier_config(two_view_config, name="two_view_config")
+    base_only = _resolve_base_only_ablation_config(base_only_result)
+    authoritative = base_only_config_delta(two_view, base_only)
+    provided = require_permitted_config_delta(base_only_result["config_delta"])
+    if provided != authoritative:
+        raise ValueError("config delta drifted from authoritative model configuration")
     ablation = compare_ablation(dict(two_view_report), dict(base_report), bootstrap_indices=bootstrap_indices)
     payload = {
         "schema": "osx_cover_w3_paired_ablation_report_v1",
@@ -395,7 +401,7 @@ def matched_base_only_run_to_paired_ablation_report(
         "w5_eligible": False,
         "accepted": False,
         "variant": "base_only_evidence",
-        "config_delta": config_delta,
+        "config_delta": authoritative,
         "matched_identity": base_only_result["identity"],
         "ablation": ablation,
         "two_view_report_hash": two_view_report.get("content_hash"),
@@ -412,6 +418,31 @@ def matched_base_only_run_to_paired_ablation_report(
         encoding="utf-8",
     )
     return payload
+
+
+def _resolve_ablation_verifier_config(
+    value: VerifierConfig | Mapping[str, Any] | VerifierModel, *, name: str
+) -> VerifierConfig:
+    if isinstance(value, VerifierConfig):
+        return value
+    if isinstance(value, VerifierModel):
+        return value.config
+    if isinstance(value, Mapping):
+        return _verifier_config_from_dict(dict(value))
+    raise ValueError(f"{name} must be a VerifierConfig, VerifierModel, or config mapping")
+
+
+def _resolve_base_only_ablation_config(base_only_result: Mapping[str, Any]) -> VerifierConfig:
+    if "model" in base_only_result:
+        model = base_only_result["model"]
+        if isinstance(model, VerifierModel):
+            return model.config
+        config = getattr(model, "config", None)
+        if isinstance(config, VerifierConfig):
+            return config
+    if "config" in base_only_result:
+        return _resolve_ablation_verifier_config(base_only_result["config"], name="base_only_result.config")
+    raise ValueError("matched base-only result must carry authoritative model or config identity")
 
 
 def run_fixture_end_to_end(*, output_root: Path) -> dict[str, Any]:
@@ -851,6 +882,7 @@ def run_canonical_acceptance(
         ablation_payload = matched_base_only_run_to_paired_ablation_report(
             two_view_report=report,
             two_view_identity=two_view_identity,
+            two_view_config=model.config,
             base_only_result=base_only,
             bootstrap_indices=bootstrap,
             output_root=staging / "base_only" / "paired_ablation",

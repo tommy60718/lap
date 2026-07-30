@@ -24,11 +24,19 @@ from lap.verifiers.cover.training import make_base_only_config
 from lap.verifiers.cover.training import reset_approved_seed
 
 
-def _permitted_delta():
-    return {
-        "use_wrist": {"two_view": True, "base_only": False},
-        "fusion_input_width": {"two_view": 48, "base_only": 32},
-    }
+def _bound_configs():
+    two_view = VerifierConfig(
+        backbone_width=32,
+        embedding_width=16,
+        visual_tokens=8,
+        num_heads=4,
+        pooling_layers=1,
+        trajectory_layers=1,
+        feed_forward_width=32,
+        use_wrist=True,
+    )
+    base_model = VerifierModel(make_base_only_config(two_view), TinyFrozenBackbone(width=32, tokens=8))
+    return two_view, base_model, base_only_config_delta(two_view, base_model.config)
 
 
 def _identity(bootstrap, **overrides):
@@ -157,16 +165,19 @@ def test_reset_approved_seed_restores_torch_rng():
 
 def test_public_seam_rejects_mismatched_run_identity(tmp_path):
     two, base, bootstrap = _reports()
+    two_view, base_model, honest = _bound_configs()
     two_identity = _identity(bootstrap)
     base_identity = _identity(bootstrap, sample_ids=[f"other-{i}" for i in range(8)])
     with pytest.raises(ValueError, match="identity mismatch"):
         matched_base_only_run_to_paired_ablation_report(
             two_view_report=two,
             two_view_identity=two_identity,
+            two_view_config=two_view,
             base_only_result={
                 "report": base,
                 "identity": base_identity,
-                "config_delta": _permitted_delta(),
+                "config_delta": honest,
+                "model": base_model,
             },
             bootstrap_indices=bootstrap,
             output_root=tmp_path / "ablation",
@@ -176,16 +187,19 @@ def test_public_seam_rejects_mismatched_run_identity(tmp_path):
 
 def test_public_seam_rejects_mismatched_evaluation_artifact_hash(tmp_path):
     two, base, bootstrap = _reports()
+    two_view, base_model, honest = _bound_configs()
     two_identity = _identity(bootstrap)
     base_identity = _identity(bootstrap, evaluation={**two_identity["evaluation"], "bootstrap_indices_hash": "x" * 64})
     with pytest.raises(ValueError, match="identity mismatch"):
         matched_base_only_run_to_paired_ablation_report(
             two_view_report=two,
             two_view_identity=two_identity,
+            two_view_config=two_view,
             base_only_result={
                 "report": base,
                 "identity": base_identity,
-                "config_delta": _permitted_delta(),
+                "config_delta": honest,
+                "model": base_model,
             },
             bootstrap_indices=bootstrap,
             output_root=tmp_path / "ablation",
@@ -195,19 +209,22 @@ def test_public_seam_rejects_mismatched_evaluation_artifact_hash(tmp_path):
 
 def test_w3_08_r1_public_seam_rejects_forged_config_delta_without_output(tmp_path):
     two, base, bootstrap = _reports()
+    two_view, base_model, honest = _bound_configs()
     identity = _identity(bootstrap)
     forged = {
-        **_permitted_delta(),
+        **honest,
         "learning_rate": {"two_view": 1e-6, "base_only": 1e-5},
     }
     with pytest.raises(ValueError, match="exactly wrist omission and fresh fusion width"):
         matched_base_only_run_to_paired_ablation_report(
             two_view_report=two,
             two_view_identity=identity,
+            two_view_config=two_view,
             base_only_result={
                 "report": base,
                 "identity": identity,
                 "config_delta": forged,
+                "model": base_model,
             },
             bootstrap_indices=bootstrap,
             output_root=tmp_path / "ablation-r1",
@@ -218,6 +235,7 @@ def test_w3_08_r1_public_seam_rejects_forged_config_delta_without_output(tmp_pat
 
 def test_w3_08_r1_public_seam_rejects_inconsistent_fusion_width_without_output(tmp_path):
     two, base, bootstrap = _reports()
+    two_view, base_model, _honest = _bound_configs()
     identity = _identity(bootstrap)
     inconsistent = {
         "use_wrist": {"two_view": True, "base_only": False},
@@ -227,10 +245,12 @@ def test_w3_08_r1_public_seam_rejects_inconsistent_fusion_width_without_output(t
         matched_base_only_run_to_paired_ablation_report(
             two_view_report=two,
             two_view_identity=identity,
+            two_view_config=two_view,
             base_only_result={
                 "report": base,
                 "identity": identity,
                 "config_delta": inconsistent,
+                "model": base_model,
             },
             bootstrap_indices=bootstrap,
             output_root=tmp_path / "ablation-r1-fusion",
@@ -238,8 +258,59 @@ def test_w3_08_r1_public_seam_rejects_inconsistent_fusion_width_without_output(t
     assert not (tmp_path / "ablation-r1-fusion").exists()
 
 
+def test_w3_08_r1_rejects_structurally_valid_delta_that_contradicts_model(tmp_path):
+    two, base, bootstrap = _reports()
+    two_view, base_model, honest = _bound_configs()
+    identity = _identity(bootstrap)
+    assert base_model.config.fusion_input_width == 32
+    assert honest["fusion_input_width"]["base_only"] == 32
+    forged = {
+        "use_wrist": {"two_view": True, "base_only": False},
+        "fusion_input_width": {"two_view": 300, "base_only": 200},
+    }
+    with pytest.raises(ValueError, match="authoritative model configuration"):
+        matched_base_only_run_to_paired_ablation_report(
+            two_view_report=two,
+            two_view_identity=identity,
+            two_view_config=two_view,
+            base_only_result={
+                "report": base,
+                "identity": identity,
+                "config_delta": forged,
+                "model": base_model,
+            },
+            bootstrap_indices=bootstrap,
+            output_root=tmp_path / "ablation-r1-authority",
+        )
+    assert not (tmp_path / "ablation-r1-authority").exists()
+    assert not (tmp_path / "ablation-r1-authority" / "paired_ablation.json").exists()
+
+
+def test_w3_08_r1_emits_exact_authoritative_wrist_and_fusion_delta(tmp_path):
+    two, base, bootstrap = _reports()
+    two_view, base_model, honest = _bound_configs()
+    identity = _identity(bootstrap)
+    payload = matched_base_only_run_to_paired_ablation_report(
+        two_view_report=two,
+        two_view_identity=identity,
+        two_view_config=two_view,
+        base_only_result={
+            "report": base,
+            "identity": identity,
+            "config_delta": honest,
+            "model": base_model,
+        },
+        bootstrap_indices=bootstrap,
+        output_root=tmp_path / "ablation-r1-green",
+    )
+    assert payload["config_delta"] == honest
+    assert payload["config_delta"]["use_wrist"] == {"two_view": True, "base_only": False}
+    assert payload["config_delta"]["fusion_input_width"] == {"two_view": 48, "base_only": 32}
+
+
 def test_w3_08_r2_public_seam_rejects_substituted_bootstrap_without_output(tmp_path):
     two, base, bootstrap = _reports()
+    two_view, base_model, honest = _bound_configs()
     identity = _identity(bootstrap)
     substituted = np.zeros_like(bootstrap)
     assert not np.array_equal(substituted, bootstrap)
@@ -247,10 +318,12 @@ def test_w3_08_r2_public_seam_rejects_substituted_bootstrap_without_output(tmp_p
         matched_base_only_run_to_paired_ablation_report(
             two_view_report=two,
             two_view_identity=identity,
+            two_view_config=two_view,
             base_only_result={
                 "report": base,
                 "identity": identity,
-                "config_delta": _permitted_delta(),
+                "config_delta": honest,
+                "model": base_model,
             },
             bootstrap_indices=substituted,
             output_root=tmp_path / "ablation-r2",
@@ -282,15 +355,18 @@ def test_compare_ablation_reports_zero_containing_interval_honestly():
 
 def test_public_seam_writes_nondeployable_paired_evidence_and_w5_rejects(tmp_path):
     two, base, bootstrap = _reports()
+    two_view, base_model, honest = _bound_configs()
     identity = _identity(bootstrap)
     output_root = tmp_path / "ablation"
     payload = matched_base_only_run_to_paired_ablation_report(
         two_view_report=two,
         two_view_identity=identity,
+        two_view_config=two_view,
         base_only_result={
             "report": base,
             "identity": identity,
-            "config_delta": _permitted_delta(),
+            "config_delta": honest,
+            "model": base_model,
         },
         bootstrap_indices=bootstrap,
         output_root=output_root,
@@ -299,25 +375,14 @@ def test_public_seam_writes_nondeployable_paired_evidence_and_w5_rejects(tmp_pat
     assert payload["deployable"] is False
     assert payload["w5_eligible"] is False
     assert payload["accepted"] is False
+    assert payload["config_delta"] == honest
     assert (output_root / "paired_ablation.json").is_file()
     assert (output_root / "EVIDENCE_ONLY_NONDEPLOYABLE").is_file()
     assert payload["ablation"]["wrist_benefit_established"] is True
-    model = VerifierModel(
-        VerifierConfig(
-            backbone_width=32,
-            embedding_width=16,
-            visual_tokens=8,
-            num_heads=4,
-            pooling_layers=1,
-            trajectory_layers=1,
-            feed_forward_width=32,
-        ),
-        TinyFrozenBackbone(width=32, tokens=8),
-    )
     with pytest.raises(ValueError, match="nondeployable"):
         publish_deployment_bundle(
             output_root / "deployment_attempt",
-            model=model,
+            model=base_model,
             metadata={"deployable": False},
         )
 
