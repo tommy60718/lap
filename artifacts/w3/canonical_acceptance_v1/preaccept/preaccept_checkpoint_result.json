@@ -1,0 +1,1 @@
+{"checkpoint":"artifacts/w3/.canonical_acceptance_v1.staging/preaccept/preaccept_checkpoint.pt","content_hash":"4c38870b02213852c1b8552c28e95e1301f136c64b84a9fc9e17cd961e9ca8c8","exact_resume":"passed","gradient_synchronization":"two_rank_ddp","per_rank_batch_size":64,"schema":"osx_cover_w3_preaccept_checkpoint_v1","two_rank_step":"passed","world_size":2}

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import json
 from pathlib import Path
+import shutil
 from typing import Any
 
 import numpy as np
@@ -12,6 +13,15 @@ import torch
 from torch.utils.data import DataLoader
 
 from lap.verifiers.cover.bridge_audit import apply_audited_initialization
+from lap.verifiers.cover.canonical import CANONICAL_PACKAGE_SCOPE
+from lap.verifiers.cover.canonical import load_deployment_bundle_for_acceptance
+from lap.verifiers.cover.canonical import protocol_from_validated
+from lap.verifiers.cover.canonical import require_canonical_training_host
+from lap.verifiers.cover.canonical import run_matched_base_only_two_rank_ddp
+from lap.verifiers.cover.canonical import run_preaccept_two_rank_step_and_resume
+from lap.verifiers.cover.canonical import run_repeated_fixed_best_evaluation
+from lap.verifiers.cover.canonical import train_two_rank_ddp
+from lap.verifiers.cover.canonical import write_w5_handoff_payload
 from lap.verifiers.cover.checkpoint import build_checkpoint_contract
 from lap.verifiers.cover.checkpoint import build_four_state_inventory
 from lap.verifiers.cover.checkpoint import build_progress
@@ -757,6 +767,84 @@ def run_package_mode(*, evidence_root: Path, output_root: Path) -> dict[str, Any
     return package_receipt
 
 
+def _load_two_view_model_from_best(
+    checkpoint: Path,
+    *,
+    protocol_payload: Mapping[str, Any],
+) -> VerifierModel:
+    """Reload the fixed best two-view checkpoint for deployment packaging."""
+
+    checkpoint = require_explicit_best_checkpoint(Path(checkpoint))
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or "contract" not in payload:
+        raise ValueError("canonical packaging requires an explicit W3 training checkpoint")
+    contract = payload["contract"]
+    config = _verifier_config_from_dict(contract["model_config"])
+    model = VerifierModel(config, OpenClipSigLIP2Backbone(pretrained="hf-hub:timm/ViT-L-16-SigLIP2-384"))
+    load_fixed_best_checkpoint_logit_scale(
+        checkpoint,
+        model,
+        expected_protocol_content_hash=str(protocol_payload["content_hash"]),
+        expected_train_manifest_hash=str(protocol_payload["identities"]["train_manifest_hash"]),
+        expected_phrase_manifest_hash=str(protocol_payload["identities"]["phrase_manifest_hash"]),
+    )
+    return model
+
+
+def _cleanup_staging(staging: Path) -> None:
+    if not staging.exists():
+        return
+    for path in sorted(staging.rglob("*"), reverse=True):
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+    staging.rmdir()
+
+
+def _preserve_failure_evidence(staging: Path, evidence_root: Path) -> Path | None:
+    """Copy bounded failure diagnostics before staging cleanup (not acceptance evidence)."""
+
+    if not staging.exists():
+        return None
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    destination = evidence_root / f"failure-{staging.name}-{_utc_stamp()}"
+    destination.mkdir(parents=True, exist_ok=False)
+    patterns = (
+        "train_worker_error_rank*.txt",
+        "preaccept_worker_error_rank*.txt",
+        "train_result.json",
+        "preaccept_checkpoint_result.json",
+        "**/train_worker_error_rank*.txt",
+        "**/preaccept_worker_error_rank*.txt",
+        "**/train_result.json",
+    )
+    copied = 0
+    for pattern in patterns:
+        for path in staging.glob(pattern):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(staging)
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            copied += 1
+    manifest = {
+        "schema": "osx_cover_w3_09_failure_evidence_v1",
+        "staging": str(staging),
+        "copied_files": copied,
+        "note": "diagnostic only; not an accepted W3 package",
+    }
+    (destination / "failure_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return destination
+
+
+def _utc_stamp() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 def run_canonical_acceptance(
     *,
     w2_root: Path,
@@ -768,6 +856,8 @@ def run_canonical_acceptance(
     device: torch.device | None = None,
 ) -> dict[str, Any]:
     """Run the complete canonical path; publication occurs only after acceptance."""
+
+    del device  # canonical acceptance always uses the locked two-rank CUDA host
     receipt = preflight_w3(
         w2_root=w2_root,
         bridge_artifact=bridge_artifact,
@@ -776,165 +866,91 @@ def run_canonical_acceptance(
         validator_path=validator_path,
         protocol_dir=protocol_dir,
     )
-    dataset = W2DatasetGateway(Path(w2_root), validator_path=validator_path)
-    protocol_payload = json.loads((Path(protocol_dir) / "run_protocol.json").read_text(encoding="utf-8"))
-    protocol = RunProtocol(
-        seed=int(protocol_payload["seed"]),
-        sampler_seed=int(protocol_payload["sampler"]["seed"]),
-        per_rank_batch_size=int(protocol_payload["batch"]["per_rank"]),
-        world_size=int(protocol_payload["sampler"]["world_size"]),
-        epochs=int(protocol_payload["optimization"]["epochs"]),
-        learning_rate=float(protocol_payload["optimization"]["learning_rate"]),
-        warmup_epochs=int(protocol_payload["optimization"]["warmup_epochs"]),
-        gradient_clip_norm=float(protocol_payload["optimization"]["gradient_clip_norm"]),
-        bootstrap_replicates=int(protocol_payload["evaluation"]["bootstrap_replicates"]),
-    )
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = VerifierModel(VerifierConfig(), OpenClipSigLIP2Backbone(pretrained="hf-hub:timm/ViT-L-16-SigLIP2-384"))
-    audit = json.loads(Path(audit_manifest).read_text(encoding="utf-8"))
-    apply_audited_initialization(model, Path(bridge_artifact), audit)
-    train_preprocess = getattr(model.backbone, "preprocess", None)
-    dataset_kwargs = {} if train_preprocess is None else {"preprocess": train_preprocess}
-    train_dataset = TwoViewDataset(dataset.train, seed=protocol.seed, training=True, **dataset_kwargs)
+    host = require_canonical_training_host()
     staging = Path(output_root).parent / f".{Path(output_root).name}.staging"
     if staging.exists():
         raise FileExistsError(staging)
     staging.mkdir(parents=True)
-    validation_dataset = TwoViewDataset(dataset.validation, training=False, **dataset_kwargs)
-    checkpoint_contract = build_checkpoint_contract(
-        audit_manifest_sha256=audit["manifest_sha256"],
-        bridge_artifact_sha256=audit["artifact"]["sha256"],
-        target_fingerprint=audit["target"]["fingerprint"],
-        protocol_content_hash=protocol_payload["content_hash"],
-        protocol_version=protocol_payload["protocol_version"],
-        model_config=model.config.to_dict(),
-        four_state_inventory=build_four_state_inventory(),
-        w2_identities={
-            "train_manifest_hash": protocol_payload["identities"]["train_manifest_hash"],
-            "phrase_manifest_hash": protocol_payload["identities"]["phrase_manifest_hash"],
-            "normalization_artifact_hash": dataset.validation_receipt.get(
-                "normalization_artifact_hash", dataset.validation_receipt.get("content_hash", "")
-            ),
-            "w2_validation_receipt": dataset.validation_receipt,
-        },
-        environment={
-            "torch": torch.__version__,
-            "backbone_revision": getattr(model.backbone, "backbone_revision", None),
-            "preprocessing_contract": "openclip_model_eval_transform_v1",
-            "views": ["base_rgb", "wrist_rgb"],
-            "cuda_rng_device_count": recorded_cuda_rng_device_count(),
-        },
-    )
-    training = train_model(
-        model,
-        train_dataset,
-        protocol=protocol,
-        device=device,
-        validation_dataset=validation_dataset,
-        checkpoint_dir=staging,
-        checkpoint_contract=checkpoint_contract,
-    )
     try:
-        embeddings = collect_embeddings(
-            model, validation_dataset, device=device, batch_size=protocol.per_rank_batch_size
+        preaccept = run_preaccept_two_rank_step_and_resume(
+            w2_root=Path(w2_root),
+            bridge_artifact=Path(bridge_artifact),
+            audit_manifest=Path(audit_manifest),
+            protocol_dir=Path(protocol_dir),
+            work_dir=staging / "preaccept",
+            validator_path=validator_path,
         )
-        shuffled = json.loads((Path(protocol_dir) / "shuffled_pairs.json").read_text(encoding="utf-8"))["pairs"]
-        nearby = json.loads((Path(protocol_dir) / "nearby_pairs.json").read_text(encoding="utf-8"))["pairs"]
-        bootstrap = np.load(Path(protocol_dir) / "bootstrap_indices.npy")
-        report = evaluate_embeddings(
-            embeddings["semantic"],
-            embeddings["action"],
-            sample_ids=embeddings["sample_ids"],
-            episode_ids=embeddings["episode_ids"],
-            conditions=embeddings["conditions"],
-            shuffled_pairs=shuffled,
-            nearby_pairs=nearby,
-            bootstrap_indices=bootstrap,
-            checkpoint_logit_scale=float(model.logit_scale.detach().clamp(0.0, np.log(100.0)).exp()),
-            strict_protocol=True,
+        protocol_evidence = validate_protocol_directory(Path(protocol_dir), require_complete=True)
+        protocol_payload = protocol_evidence["protocol"]
+        protocol = protocol_from_validated(protocol_payload)
+        dataset = W2DatasetGateway(Path(w2_root), validator_path=validator_path)
+        training = train_two_rank_ddp(
+            w2_root=Path(w2_root),
+            bridge_artifact=Path(bridge_artifact),
+            audit_manifest=Path(audit_manifest),
+            protocol_dir=Path(protocol_dir),
+            checkpoint_dir=staging,
+            validator_path=validator_path,
+            use_wrist=True,
         )
-        require_acceptance_metrics(report)
-        evaluation_hashes = _evaluation_artifact_hashes(
-            shuffled_pairs=shuffled, nearby_pairs=nearby, bootstrap_indices=bootstrap
+        evaluation = run_repeated_fixed_best_evaluation(
+            checkpoint=staging / "best.pt",
+            w2_root=Path(w2_root),
+            protocol_dir=Path(protocol_dir),
+            output_root=staging / "evaluation",
+            validator_path=validator_path,
         )
+        report = evaluation["report"]
+        metrics = evaluation["metrics"]
+        shuffled = protocol_evidence["shuffled_pairs"]["pairs"]
+        nearby = protocol_evidence["nearby_pairs"]["pairs"]
+        bootstrap = protocol_evidence["bootstrap_indices"]
+        sample_ids = list(metrics["row_metrics"]["sample_ids"])
         two_view_identity = build_matched_ablation_identity(
             protocol=protocol,
-            sample_ids=embeddings["sample_ids"],
+            sample_ids=sample_ids,
             phrase_manifest_hash=protocol_payload["identities"]["phrase_manifest_hash"],
             protocol_content_hash=protocol_payload["content_hash"],
-            evaluation_artifact_hashes=evaluation_hashes,
+            evaluation_artifact_hashes=_evaluation_artifact_hashes(
+                shuffled_pairs=shuffled,
+                nearby_pairs=nearby,
+                bootstrap_indices=bootstrap,
+            ),
         )
-        base_only = run_matched_base_only(
-            two_view_model=model,
+        model = _load_two_view_model_from_best(staging / "best.pt", protocol_payload=protocol_payload)
+        base_only_dir = staging / "base_only"
+        base_only_dir.mkdir(parents=True, exist_ok=True)
+        base_only = run_matched_base_only_two_rank_ddp(
+            w2_root=Path(w2_root),
             bridge_artifact=Path(bridge_artifact),
-            audit_manifest=audit,
-            dataset=dataset,
-            protocol=protocol,
+            audit_manifest=Path(audit_manifest),
+            protocol_dir=Path(protocol_dir),
+            checkpoint_dir=base_only_dir,
+            validator_path=validator_path,
+            two_view_model=model,
             shuffled_pairs=shuffled,
             nearby_pairs=nearby,
             bootstrap_indices=bootstrap,
-            device=device,
             two_view_identity=two_view_identity,
             phrase_manifest_hash=protocol_payload["identities"]["phrase_manifest_hash"],
             protocol_content_hash=protocol_payload["content_hash"],
         )
-        (staging / "base_only").mkdir()
         ablation_payload = matched_base_only_run_to_paired_ablation_report(
-            two_view_report=report,
+            two_view_report=metrics,
             two_view_identity=two_view_identity,
             two_view_config=model.config,
             base_only_result=base_only,
             bootstrap_indices=bootstrap,
-            output_root=staging / "base_only" / "paired_ablation",
+            output_root=base_only_dir / "paired_ablation",
         )
         ablation = ablation_payload["ablation"]
-        save_training_checkpoint(
-            staging / "base_only" / "latest.pt",
-            model=base_only["model"],
-            optimizer=base_only["training"]["optimizer"],
-            scheduler=base_only["training"]["scheduler"],
-            progress=base_only["training"]["progress"],
-            contract=build_checkpoint_contract(
-                audit_manifest_sha256=audit["manifest_sha256"],
-                bridge_artifact_sha256=audit["artifact"]["sha256"],
-                target_fingerprint=audit["target"]["fingerprint"],
-                protocol_content_hash=protocol_payload["content_hash"],
-                protocol_version=protocol_payload["protocol_version"],
-                model_config=base_only["model"].config.to_dict(),
-                four_state_inventory=build_four_state_inventory(),
-                w2_identities={
-                    "train_manifest_hash": protocol_payload["identities"]["train_manifest_hash"],
-                    "phrase_manifest_hash": protocol_payload["identities"]["phrase_manifest_hash"],
-                    "normalization_artifact_hash": dataset.validation_receipt.get(
-                        "normalization_artifact_hash", dataset.validation_receipt.get("content_hash", "")
-                    ),
-                    "variant": "base_only",
-                    "deployable": False,
-                },
-                environment={
-                    "torch": torch.__version__,
-                    "variant": "base_only",
-                    "deployable": False,
-                    "cuda_rng_device_count": recorded_cuda_rng_device_count(),
-                },
-            ),
-            sampler_state={
-                "epoch": base_only["training"]["progress"]["epoch"],
-                "rank": 0,
-                "world_size": base_only["training"]["progress"]["world_size"],
-            },
-            rank=0,
-            rng_states={
-                rank: capture_rng_state(cuda_rng_device_count=recorded_cuda_rng_device_count())
-                for rank in range(int(base_only["training"]["progress"]["world_size"]))
-            },
-        )
-        (staging / "base_only" / "metadata.json").write_bytes(
+        audit = json.loads(Path(audit_manifest).read_text(encoding="utf-8"))
+        (base_only_dir / "metadata.json").write_bytes(
             canonical_bytes(
                 {
                     "schema": "osx_cover_w3_base_only_evidence_v1",
                     "deployable": False,
-                    "model_config": base_only["model"].config.to_dict(),
+                    "model_config": base_only.get("model_config", base_only["model"].config.to_dict()),
                     "evaluation_report": base_only["report"],
                     "ablation_report": ablation,
                 }
@@ -959,7 +975,12 @@ def run_canonical_acceptance(
                 "protocol_version": protocol_payload["protocol_version"],
             },
             "four_state_inventory": build_four_state_inventory(),
-            "package_scope": "pipeline_acceptance_not_canonical_w3_09",
+            "package_scope": CANONICAL_PACKAGE_SCOPE,
+            "host": host,
+            "preaccept": {
+                "two_rank_step": preaccept["two_rank_step"],
+                "exact_resume": preaccept["exact_resume"],
+            },
             "scorer_compatibility": {
                 "model_schema_version": "osx_cover_verifier_checkpoint_v1",
                 "views": ["base_rgb", "wrist_rgb"],
@@ -973,24 +994,49 @@ def run_canonical_acceptance(
                 "output_shape_rank": 1,
             },
         }
-        publish_deployment_bundle(staging / "deployment", model=model, metadata=metadata)
+        publish_deployment_bundle(staging / "deployment", model=model, metadata=metadata, accepted_marker=True)
+        from lap.verifiers.cover.batch_probe import _resolve_pinned_snapshot
+
+        pinned_snapshot = _resolve_pinned_snapshot()
+        load_deployment_bundle_for_acceptance(
+            staging / "deployment",
+            expected_normalization_hash=str(dataset.validation_receipt["normalization_artifact_hash"]),
+            model_factory=lambda: VerifierModel(
+                model.config,
+                OpenClipSigLIP2Backbone(model_name=f"local-dir:{pinned_snapshot}"),
+            ),
+            preprocessing=model.backbone.preprocess,
+        )
         final_report = {
             "schema": "osx_cover_w3_acceptance_v1",
             "preflight": receipt,
-            "training": training["history"],
-            "evaluation": report,
+            "host": host,
+            "preaccept": preaccept,
+            "training": training.get("history", training),
+            "evaluation": {
+                **report,
+                "repeated_byte_identical": bool(evaluation.get("repeated_byte_identical")),
+            },
+            "base_only": {
+                "deployable": False,
+                "report_hash": base_only["report"].get("content_hash"),
+                "ablation_hash": ablation_payload.get("content_hash"),
+            },
             "deployment": "deployment",
+            "package_scope": CANONICAL_PACKAGE_SCOPE,
             "authority": "recorded_data_offline_integration_only",
         }
         final_report["content_hash"] = content_hash(final_report)
         (staging / "acceptance.json").write_bytes(canonical_bytes(final_report) + b"\n")
+        write_w5_handoff_payload(
+            output_root=staging,
+            acceptance_report=final_report,
+            deployment_root=staging / "deployment",
+        )
         staging.rename(output_root)
     except Exception:
-        for path in sorted(staging.rglob("*"), reverse=True):
-            if path.is_file():
-                path.unlink()
-            elif path.is_dir():
-                path.rmdir()
-        staging.rmdir()
+        evidence_dir = Path(output_root).parent / "evidence"
+        _preserve_failure_evidence(staging, evidence_dir)
+        _cleanup_staging(staging)
         raise
     return final_report

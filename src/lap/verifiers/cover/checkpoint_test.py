@@ -365,6 +365,57 @@ def test_load_deployment_bundle_score_requires_accepted_marker_and_validates_bef
         torch.testing.assert_close(tensor, before[name], atol=0.0, rtol=0.0)
 
 
+def test_deployment_scorer_accepts_numpy_uint8_with_pil_only_preprocess(tmp_path):
+    """W5 cameras are uint8 HWC; OpenCLIP eval transforms reject raw ndarray."""
+
+    from PIL import Image
+
+    seen: list[type] = []
+
+    def pil_only_preprocess(image):
+        seen.append(type(image))
+        if not isinstance(image, Image.Image):
+            raise TypeError(f"Unexpected type {type(image)}")
+        image = image.convert("RGB").resize((384, 384), Image.Resampling.BICUBIC)
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        return torch.from_numpy(array).permute(2, 0, 1)
+
+    model = _model()
+    root = tmp_path / "deployment"
+    publish_deployment_bundle(root, model=model, metadata=_scorer_metadata(), accepted_marker=True)
+    loaded = load_deployment_bundle(
+        root,
+        model_factory=_model,
+        expected_normalization_hash="1" * 64,
+        preprocessing=pil_only_preprocess,
+    )
+    scores = loaded.score(
+        base_rgb=np.zeros((224, 224, 3), dtype=np.uint8),
+        wrist_rgb=np.full((224, 224, 3), 7, dtype=np.uint8),
+        instruction="insert peg",
+        action_histories=np.zeros((2, 10, 7), dtype=np.float32),
+    )
+    assert scores.shape == (2,)
+    assert np.isfinite(scores).all()
+    assert seen == [Image.Image, Image.Image]
+
+    # PIL inputs remain accepted.
+    scores_pil = loaded.score(
+        base_rgb=Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8), mode="RGB"),
+        wrist_rgb=Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8), mode="RGB"),
+        instruction="insert peg",
+        action_histories=np.zeros((1, 10, 7), dtype=np.float32),
+    )
+    assert scores_pil.shape == (1,)
+
+
+def test_deployment_scorer_rejects_non_hwc_rgb():
+    from lap.verifiers.cover.checkpoint import _as_pil_rgb
+
+    with pytest.raises(ValueError, match="HWC"):
+        _as_pil_rgb(np.zeros((224, 224), dtype=np.uint8))
+
+
 def test_nondeployable_bundle_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="nondeployable"):
         publish_deployment_bundle(tmp_path / "deployment", model=_model(), metadata={"deployable": False})

@@ -1,0 +1,110 @@
+{
+  "schema": "osx_cover_w3_09_package_identity_v1",
+  "package_root": "artifacts/w3/canonical_acceptance_v1",
+  "host_run": {
+    "start": "2026-08-02T15:39:54+09:00",
+    "end": "2026-08-02T20:38:48+09:00",
+    "end_exit": 0,
+    "lap_base": "c0089a1dbe4ebb21b1879621e7ac2b51cf086d26",
+    "host": "abacus"
+  },
+  "files": {
+    "acceptance.json": {
+      "sha256": "f8926271931185d351e765383727f7ec9a9b85d9e04b7480916b26c68d81804d",
+      "size": 76074
+    },
+    "base_only/best.pt": {
+      "sha256": "da3772b75ae3901f58e5d50042ae7879e955ad8c29b2bf0a3445ae869bfdc4fd",
+      "size": 2078165509
+    },
+    "base_only/latest.pt": {
+      "sha256": "7a4c16b7b02818d29e9fa4928094ff82f01d12bb841b4fd5511354fdb3aee38e",
+      "size": 2078233393
+    },
+    "base_only/metadata.json": {
+      "sha256": "42c237994f7f9719d880464514e2112334ac0ae893c6da399c0306bc11272299",
+      "size": 237470
+    },
+    "base_only/paired_ablation/EVIDENCE_ONLY_NONDEPLOYABLE": {
+      "sha256": "806107161e409c8b4c59bc0b2037fe9a08d70f18a77d8f83bfbc4b510af2c0d3",
+      "size": 74
+    },
+    "base_only/paired_ablation/paired_ablation.json": {
+      "sha256": "3b433bc95658bc4bee9a411c79d615dc1dc1da6acc798ab563ed56c15edad140",
+      "size": 35463
+    },
+    "base_only/train_result.json": {
+      "sha256": "03f335ed4c828f3730a16d2e80e3ddfe3de81e5b1658712c5199c3a120e5132d",
+      "size": 65480
+    },
+    "best.pt": {
+      "sha256": "f42947377ae2cb0c09eb9bc68abc6c63340882bdbb711118a57681316808e345",
+      "size": 2081311237
+    },
+    "deployment/ACCEPTED_W3_DEPLOYMENT": {
+      "sha256": "4c80eef380f0cad46505666aa48709bb28424ef04d595ce21634b4f988c9d8ca",
+      "size": 27
+    },
+    "deployment/content_index.json": {
+      "sha256": "ddec1d7733f52b4854718b0ca82ba196ec046312a11dde88c942f3ac9b92036e",
+      "size": 388
+    },
+    "deployment/metadata.json": {
+      "sha256": "99c1f3b5b8f1b360cdee82e95c8471c0a8f0fa5ffe77553ad14281c9900282eb",
+      "size": 9704
+    },
+    "deployment/model.pt": {
+      "sha256": "7dc74431ecc7369f2bae5a297a63c65ccac23b17f8da8598de12e3c8e5c0ca2c",
+      "size": 3634095379
+    },
+    "evaluation/evaluation.json": {
+      "sha256": "fe322e818f7b1a3a3de47a0ba73ec1b059714ed6fc351ea9383c96fdd79c1d63",
+      "size": 5866
+    },
+    "evaluation/evaluation_report.txt": {
+      "sha256": "b4998e2a82f627ea2b87f017b510d6b3d6ef77dd7d25a763612ad44feab8a542",
+      "size": 5097
+    },
+    "latest.pt": {
+      "sha256": "e0da7e61f4d1e55eb7184b4615453f31f0c77a81bb03e9042a85140266d2ebb8",
+      "size": 2081379121
+    },
+    "preaccept/fresh_ddp_step/rank-0.json": {
+      "sha256": "41fb52dd55ca98511176b6cf9a5534773bcccd1ad1862923f521c65645ab8a92",
+      "size": 857
+    },
+    "preaccept/fresh_ddp_step/rank-1.json": {
+      "sha256": "c80e75c7f7e99daf2afea4e0034538a8f70764f12c8d312b0c09292916d906ed",
+      "size": 857
+    },
+    "preaccept/preaccept_checkpoint.pt": {
+      "sha256": "f937315545526daf3ddca59b6160170efda2396d5bd14614858182bbfdfe051f",
+      "size": 2081403493
+    },
+    "preaccept/preaccept_checkpoint_result.json": {
+      "sha256": "52b6aac462c0e1336b72ad364cfc3b8e70f90fc3ac3d79ec092c51c0a918aafb",
+      "size": 358
+    },
+    "train_result.json": {
+      "sha256": "ad5d8b481a351ec805ca188a80dadfae654cf800f1cee19a208ec9153e406268",
+      "size": 65480
+    },
+    "w5_handoff.json": {
+      "sha256": "344e2c3651128b48d6c676f869b5af7f14445d485aa9ee909998c6420e89ab01",
+      "size": 463
+    },
+    "../evidence/w3-09-canonical-accept.txt": {
+      "sha256": "ca42cab9e43ca5c7620cdace882da81cd4c77bf288e0efb6348374a2f6bf901f",
+      "size": 81786
+    },
+    "../evidence/w3-09-gpu-dmon.csv": {
+      "sha256": "86871d6073a772a328652ef5b422162ec91d11d4a5041a0864d2d5597966fbcb",
+      "size": 62987
+    },
+    "../evidence/w3-09-gpu-dmon.prev-20260802-153954.csv": {
+      "sha256": "7552eced350026e68a0166577423e6a091d0cbee7f608cdba48bed5950d2e782",
+      "size": 62568
+    }
+  },
+  "content_hash": "36c81b525fcc9c3379a47284b858e339d0d69619ffe5f2aa3cbaf943bcc4d2e6"
+}

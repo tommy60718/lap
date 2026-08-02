@@ -1,0 +1,27 @@
+W3 fixed-checkpoint evaluation report
+schema: osx_cover_w3_evaluation_v1
+pool_count: 1118
+top1_chance: 0.0008944543828264759
+top5_chance: 0.004472271914132379
+retrieval:
+  semantic_to_action_top1: 0.025044722719141325
+  semantic_to_action_top5: 0.11985688729874776
+  action_to_semantic_top1: 0.01967799642218247
+  action_to_semantic_top5: 0.09928443649373882
+  semantic_to_action_top1_ci95: [0.014273719563392108, 0.03788634097706879]
+  action_to_semantic_top1_ci95: [0.012334488590099588, 0.027462771973287368]
+margins:
+  aligned_minus_shuffled: mean=5.380603116909263 fraction_gt_zero=0.947841726618705 ci95=[5.065843882839245, 5.7370594499024925]
+  aligned_minus_nearby: mean=0.8616995899449866 fraction_gt_zero=0.6699463327370304 ci95=[0.5148725417180172, 1.2365291932318174]
+conditions:
+  circular:+x: count=119 semantic_to_action_top1=0.04201680672268908 action_to_semantic_top1=0.03361344537815126 aligned_minus_shuffled_mean=5.821844745223826 aligned_minus_nearby_mean=1.3873725137941504 failures=['circular_posx_demo_07:000000', 'circular_posx_demo_07:000001', 'circular_posx_demo_07:000002', 'circular_posx_demo_07:000003', 'circular_posx_demo_07:000004', 'circular_posx_demo_07:000005', 'circular_posx_demo_07:000006', 'circular_posx_demo_07:000007', 'circular_posx_demo_07:000008', 'circular_posx_demo_07:000009']
+  circular:+y: count=161 semantic_to_action_top1=0.006211180124223602 action_to_semantic_top1=0.012422360248447204 aligned_minus_shuffled_mean=5.101332801807471 aligned_minus_nearby_mean=0.6811038448485904 failures=['circular_posy_demo_07:000000', 'circular_posy_demo_07:000001', 'circular_posy_demo_07:000002', 'circular_posy_demo_07:000003', 'circular_posy_demo_07:000004', 'circular_posy_demo_07:000005', 'circular_posy_demo_07:000006', 'circular_posy_demo_07:000007', 'circular_posy_demo_07:000008', 'circular_posy_demo_07:000009']
+  circular:-x: count=147 semantic_to_action_top1=0.013605442176870748 action_to_semantic_top1=0.02040816326530612 aligned_minus_shuffled_mean=5.487100098209476 aligned_minus_nearby_mean=0.6749984333317866 failures=['circular_negx_demo_07:000000', 'circular_negx_demo_07:000001', 'circular_negx_demo_07:000002', 'circular_negx_demo_07:000003', 'circular_negx_demo_07:000004', 'circular_negx_demo_07:000005', 'circular_negx_demo_07:000006', 'circular_negx_demo_07:000007', 'circular_negx_demo_07:000008', 'circular_negx_demo_07:000009']
+  circular:-y: count=135 semantic_to_action_top1=0.02962962962962963 action_to_semantic_top1=0.02962962962962963 aligned_minus_shuffled_mean=4.974200422418175 aligned_minus_nearby_mean=0.9278368831832514 failures=['circular_negy_demo_07:000000', 'circular_negy_demo_07:000001', 'circular_negy_demo_07:000002', 'circular_negy_demo_07:000003', 'circular_negy_demo_07:000004', 'circular_negy_demo_07:000005', 'circular_negy_demo_07:000006', 'circular_negy_demo_07:000007', 'circular_negy_demo_07:000008', 'circular_negy_demo_07:000009']
+  square:+x: count=163 semantic_to_action_top1=0.006134969325153374 action_to_semantic_top1=0.012269938650306749 aligned_minus_shuffled_mean=4.684660682790927 aligned_minus_nearby_mean=-0.015953878670923974 failures=['square_posx_demo_07:000000', 'square_posx_demo_07:000001', 'square_posx_demo_07:000002', 'square_posx_demo_07:000003', 'square_posx_demo_07:000004', 'square_posx_demo_07:000005', 'square_posx_demo_07:000006', 'square_posx_demo_07:000007', 'square_posx_demo_07:000008', 'square_posx_demo_07:000009']
+  square:+y: count=116 semantic_to_action_top1=0.0603448275862069 action_to_semantic_top1=0.017241379310344827 aligned_minus_shuffled_mean=5.696494983155163 aligned_minus_nearby_mean=1.139199773657174 failures=['square_posy_demo_07:000000', 'square_posy_demo_07:000001', 'square_posy_demo_07:000002', 'square_posy_demo_07:000003', 'square_posy_demo_07:000004', 'square_posy_demo_07:000005', 'square_posy_demo_07:000006', 'square_posy_demo_07:000007', 'square_posy_demo_07:000008', 'square_posy_demo_07:000009']
+  square:-x: count=132 semantic_to_action_top1=0.022727272727272728 action_to_semantic_top1=0.0 aligned_minus_shuffled_mean=5.26426389610706 aligned_minus_nearby_mean=0.6413553841914666 failures=['square_negx_demo_07:000000', 'square_negx_demo_07:000001', 'square_negx_demo_07:000002', 'square_negx_demo_07:000003', 'square_negx_demo_07:000004', 'square_negx_demo_07:000005', 'square_negx_demo_07:000006', 'square_negx_demo_07:000007', 'square_negx_demo_07:000008', 'square_negx_demo_07:000009']
+  square:-y: count=145 semantic_to_action_top1=0.034482758620689655 action_to_semantic_top1=0.034482758620689655 aligned_minus_shuffled_mean=6.234672418998995 aligned_minus_nearby_mean=1.7237016705704244 failures=['square_negy_demo_07:000000', 'square_negy_demo_07:000001', 'square_negy_demo_07:000002', 'square_negy_demo_07:000003', 'square_negy_demo_07:000004', 'square_negy_demo_07:000005', 'square_negy_demo_07:000006', 'square_negy_demo_07:000007', 'square_negy_demo_07:000008', 'square_negy_demo_07:000009']
+content_hash: 63e572704fd14f2c0c484c27210c3e06331eac389f9dfd464f05ff41f7027400
+accepted: false
+usefulness_decision_owner: W3-09

@@ -12,6 +12,7 @@ import random
 from typing import Any
 
 import numpy as np
+from PIL import Image
 import torch
 
 from lap.verifiers.cover.scorer import ScorerCompatibility
@@ -713,8 +714,9 @@ class DeploymentScorer:
         histories = np.asarray(action_histories)
         if histories.ndim != 3 or histories.shape[1:] != (10, 7) or histories.dtype != np.float32:
             raise ValueError("action_histories must be float32[M, 10, 7]")
-        base = self.preprocessing(base_rgb).unsqueeze(0).to(self.device)
-        wrist = self.preprocessing(wrist_rgb).unsqueeze(0).to(self.device)
+        # W5 / runtime cameras supply uint8 HWC arrays; OpenCLIP eval transforms expect PIL.
+        base = self.preprocessing(_as_pil_rgb(base_rgb)).unsqueeze(0).to(self.device)
+        wrist = self.preprocessing(_as_pil_rgb(wrist_rgb)).unsqueeze(0).to(self.device)
         batch = histories.shape[0]
         with torch.no_grad():
             output = self.model(
@@ -727,6 +729,26 @@ class DeploymentScorer:
         if scores.shape != (batch,) or not np.isfinite(scores).all():
             raise ValueError("deployment scorer must return finite rank-1 candidate scores")
         return scores
+
+
+def _as_pil_rgb(image: Any) -> Image.Image:
+    """Coerce W5 camera tensors/arrays to RGB PIL for pinned OpenCLIP preprocessing."""
+
+    if isinstance(image, Image.Image):
+        return image.convert("RGB")
+    if isinstance(image, torch.Tensor):
+        array = image.detach().cpu().numpy()
+    else:
+        array = np.asarray(image)
+    if array.ndim != 3 or array.shape[-1] != 3:
+        raise ValueError("deployment RGB input must be HWC with 3 channels")
+    if array.dtype != np.uint8:
+        if np.issubdtype(array.dtype, np.floating):
+            max_value = float(np.nanmax(array)) if array.size else 0.0
+            array = np.clip(array * 255.0 if max_value <= 1.0 else array, 0, 255).astype(np.uint8)
+        else:
+            array = np.asarray(array, dtype=np.uint8)
+    return Image.fromarray(array, mode="RGB")
 
 
 def _scorer_compatibility_from_metadata(payload: Mapping[str, Any]) -> ScorerCompatibility:
