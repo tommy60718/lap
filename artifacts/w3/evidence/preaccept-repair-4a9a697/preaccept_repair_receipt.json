@@ -1,0 +1,142 @@
+{
+  "checkpoint_resume": {
+    "checkpoint": "artifacts/w3/evidence/preaccept-repair-4a9a697/preaccept_checkpoint.pt",
+    "content_hash": "f5a11f0fc2a9c7e07a1ad267ee319cdc88f3083077753037349e411b75185b50",
+    "exact_resume": "passed",
+    "gradient_synchronization": "two_rank_ddp",
+    "per_rank_batch_size": 64,
+    "rank_evidence": {
+      "0": {
+        "gradient_norm_resumed": 0.7019469738006592,
+        "gradient_norm_uninterrupted": 0.7019469738006592,
+        "loss_match": true,
+        "loss_resumed": 4.174526691436768,
+        "loss_uninterrupted": 4.174526691436768,
+        "parameter_fingerprint_match": true,
+        "parameter_fingerprint_resumed": "11fdb8a3601dee1e322982610eae063b5a0302e23153e9f345f5c803a9b7dafe",
+        "parameter_fingerprint_uninterrupted": "11fdb8a3601dee1e322982610eae063b5a0302e23153e9f345f5c803a9b7dafe",
+        "rank": 0,
+        "sampler_epoch_restored": 0
+      },
+      "1": {
+        "gradient_norm_resumed": 0.7019469738006592,
+        "gradient_norm_uninterrupted": 0.7019469738006592,
+        "loss_match": true,
+        "loss_resumed": 4.178510665893555,
+        "loss_uninterrupted": 4.178510665893555,
+        "parameter_fingerprint_match": true,
+        "parameter_fingerprint_resumed": "11fdb8a3601dee1e322982610eae063b5a0302e23153e9f345f5c803a9b7dafe",
+        "parameter_fingerprint_uninterrupted": "11fdb8a3601dee1e322982610eae063b5a0302e23153e9f345f5c803a9b7dafe",
+        "rank": 1,
+        "sampler_epoch_restored": 0
+      }
+    },
+    "ranks_restored": [
+      0,
+      1
+    ],
+    "resume_equivalence": {
+      "gradient_fingerprint_match": true,
+      "rank0_loss_match": true,
+      "rank1_loss_match": true
+    },
+    "schema": "osx_cover_w3_preaccept_checkpoint_v1",
+    "two_rank_step": "passed",
+    "uninterrupted_versus_resumed": "passed",
+    "world_size": 2
+  },
+  "ddp_step_ranks": [
+    {
+      "backward": "passed",
+      "embedding_all_gather": false,
+      "forward": "passed",
+      "free_memory_after_mib": 41308.12,
+      "frozen_backbone_dtype": "bfloat16",
+      "frozen_state_unchanged": true,
+      "gradient_fingerprint": "ae2cb2b304f6f36544818f1d9cfaa621bea1329905b86962bea35ffb6556b1cd",
+      "gradient_norm": 0.6888207793235779,
+      "gradients_finite": true,
+      "local_negative_pool_size": 64,
+      "logits_dtype": "float32",
+      "loss": 4.168344497680664,
+      "max_memory_allocated_mib": 3099.94,
+      "max_memory_reserved_mib": 5192.0,
+      "optimizer_step": "passed",
+      "parameters_finite": true,
+      "per_rank_batch_size": 64,
+      "preprocessing_fingerprint": "fd7ffb201d3e3eec5770fa313d96af1c031403cab51ae43ee734ed1d431c3b14",
+      "rank": 0,
+      "status": "passed",
+      "tokenizer_fingerprint": "e97a61cde12740e6031fa02bcd4aa39d9b0e75f1b8fe6c1ef9dad92bc4b09575",
+      "trainable_dtype": "float32",
+      "trainable_state_changed": true
+    },
+    {
+      "backward": "passed",
+      "embedding_all_gather": false,
+      "forward": "passed",
+      "free_memory_after_mib": 42156.44,
+      "frozen_backbone_dtype": "bfloat16",
+      "frozen_state_unchanged": true,
+      "gradient_fingerprint": "ae2cb2b304f6f36544818f1d9cfaa621bea1329905b86962bea35ffb6556b1cd",
+      "gradient_norm": 0.6888207793235779,
+      "gradients_finite": true,
+      "local_negative_pool_size": 64,
+      "logits_dtype": "float32",
+      "loss": 4.170263290405273,
+      "max_memory_allocated_mib": 3099.94,
+      "max_memory_reserved_mib": 5192.0,
+      "optimizer_step": "passed",
+      "parameters_finite": true,
+      "per_rank_batch_size": 64,
+      "preprocessing_fingerprint": "fd7ffb201d3e3eec5770fa313d96af1c031403cab51ae43ee734ed1d431c3b14",
+      "rank": 1,
+      "status": "passed",
+      "tokenizer_fingerprint": "e97a61cde12740e6031fa02bcd4aa39d9b0e75f1b8fe6c1ef9dad92bc4b09575",
+      "trainable_dtype": "float32",
+      "trainable_state_changed": true
+    }
+  ],
+  "exact_resume": "passed",
+  "host": {
+    "gpu_snapshot": [
+      {
+        "allocatable_total_memory_mib": 48502.6875,
+        "driver_version": "595.58.03",
+        "free_memory_mib": 47598.75,
+        "index": 0,
+        "name": "NVIDIA RTX 6000 Ada Generation",
+        "physical_total_memory_mib": 49140.0,
+        "uuid": "GPU-0ab6dcda-69ba-ffbf-2bfc-97f521430fa9"
+      },
+      {
+        "allocatable_total_memory_mib": 48510.9375,
+        "driver_version": "595.58.03",
+        "free_memory_mib": 48013.75,
+        "index": 1,
+        "name": "NVIDIA RTX 6000 Ada Generation",
+        "physical_total_memory_mib": 49140.0,
+        "uuid": "GPU-8d05c41a-24ff-71ce-8e55-b1a05e0a09a2"
+      }
+    ],
+    "gpus": [
+      "NVIDIA RTX 6000 Ada Generation",
+      "NVIDIA RTX 6000 Ada Generation"
+    ],
+    "nvidia_ctl": "/dev/nvidiactl",
+    "world_size": 2
+  },
+  "per_rank_batch_size": 64,
+  "ranks_restored": [
+    0,
+    1
+  ],
+  "resume_equivalence": {
+    "gradient_fingerprint_match": true,
+    "rank0_loss_match": true,
+    "rank1_loss_match": true
+  },
+  "two_rank_step": "passed",
+  "uninterrupted_versus_resumed": "passed",
+  "world_size": 2
+}
