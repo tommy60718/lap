@@ -736,10 +736,7 @@ def _as_pil_rgb(image: Any) -> Image.Image:
 
     if isinstance(image, Image.Image):
         return image.convert("RGB")
-    if isinstance(image, torch.Tensor):
-        array = image.detach().cpu().numpy()
-    else:
-        array = np.asarray(image)
+    array = image.detach().cpu().numpy() if isinstance(image, torch.Tensor) else np.asarray(image)
     if array.ndim != 3 or array.shape[-1] != 3:
         raise ValueError("deployment RGB input must be HWC with 3 channels")
     if array.dtype != np.uint8:

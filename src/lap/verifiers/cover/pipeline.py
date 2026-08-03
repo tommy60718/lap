@@ -1,8 +1,10 @@
 """End-to-end W3 composition used by the public script and acceptance tests."""
 
+# ruff: noqa: PLC0415
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import UTC
 import json
 from pathlib import Path
 import shutil
@@ -17,6 +19,8 @@ from lap.verifiers.cover.canonical import CANONICAL_PACKAGE_SCOPE
 from lap.verifiers.cover.canonical import load_deployment_bundle_for_acceptance
 from lap.verifiers.cover.canonical import protocol_from_validated
 from lap.verifiers.cover.canonical import require_canonical_training_host
+from lap.verifiers.cover.canonical import require_preaccept_exact_resume_receipt
+from lap.verifiers.cover.canonical import require_published_deployment_payloads
 from lap.verifiers.cover.canonical import run_matched_base_only_two_rank_ddp
 from lap.verifiers.cover.canonical import run_preaccept_two_rank_step_and_resume
 from lap.verifiers.cover.canonical import run_repeated_fixed_best_evaluation
@@ -51,7 +55,6 @@ from lap.verifiers.cover.protocol import validate_protocol_directory
 from lap.verifiers.cover.training import base_only_config_delta
 from lap.verifiers.cover.training import create_optimizer
 from lap.verifiers.cover.training import make_base_only_config
-from lap.verifiers.cover.training import require_acceptance_metrics
 from lap.verifiers.cover.training import require_permitted_config_delta
 from lap.verifiers.cover.training import reset_approved_seed
 from lap.verifiers.cover.training import train_one_batch
@@ -840,9 +843,9 @@ def _preserve_failure_evidence(staging: Path, evidence_root: Path) -> Path | Non
 
 
 def _utc_stamp() -> str:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
 def run_canonical_acceptance(
@@ -872,13 +875,15 @@ def run_canonical_acceptance(
         raise FileExistsError(staging)
     staging.mkdir(parents=True)
     try:
-        preaccept = run_preaccept_two_rank_step_and_resume(
-            w2_root=Path(w2_root),
-            bridge_artifact=Path(bridge_artifact),
-            audit_manifest=Path(audit_manifest),
-            protocol_dir=Path(protocol_dir),
-            work_dir=staging / "preaccept",
-            validator_path=validator_path,
+        preaccept = require_preaccept_exact_resume_receipt(
+            run_preaccept_two_rank_step_and_resume(
+                w2_root=Path(w2_root),
+                bridge_artifact=Path(bridge_artifact),
+                audit_manifest=Path(audit_manifest),
+                protocol_dir=Path(protocol_dir),
+                work_dir=staging / "preaccept",
+                validator_path=validator_path,
+            )
         )
         protocol_evidence = validate_protocol_directory(Path(protocol_dir), require_complete=True)
         protocol_payload = protocol_evidence["protocol"]
@@ -1007,6 +1012,7 @@ def run_canonical_acceptance(
             ),
             preprocessing=model.backbone.preprocess,
         )
+        require_published_deployment_payloads(staging / "deployment")
         final_report = {
             "schema": "osx_cover_w3_acceptance_v1",
             "preflight": receipt,
@@ -1028,12 +1034,13 @@ def run_canonical_acceptance(
         }
         final_report["content_hash"] = content_hash(final_report)
         (staging / "acceptance.json").write_bytes(canonical_bytes(final_report) + b"\n")
-        write_w5_handoff_payload(
-            output_root=staging,
-            acceptance_report=final_report,
-            deployment_root=staging / "deployment",
-        )
         staging.rename(output_root)
+        require_published_deployment_payloads(Path(output_root) / "deployment")
+        write_w5_handoff_payload(
+            output_root=Path(output_root),
+            acceptance_report=final_report,
+            deployment_root=Path(output_root) / "deployment",
+        )
     except Exception:
         evidence_dir = Path(output_root).parent / "evidence"
         _preserve_failure_evidence(staging, evidence_dir)

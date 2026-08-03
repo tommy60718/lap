@@ -1,5 +1,6 @@
 """W3-09 public-seam tests: canonical accept composition and publication gates."""
 
+# ruff: noqa: SLF001
 from __future__ import annotations
 
 from pathlib import Path
@@ -78,6 +79,77 @@ def test_preserve_failure_evidence_copies_worker_errors(tmp_path):
     assert (destination / "failure_manifest.json").is_file()
 
 
+def test_w5_handoff_deployment_root_is_package_local_final_path(tmp_path):
+    """R3: handoff must name the published package deployment, never staging."""
+
+    output_root = tmp_path / "canonical_acceptance_v1"
+    output_root.mkdir()
+    (output_root / "deployment").mkdir()
+    report = {"schema": "osx_cover_w3_acceptance_v1", "content_hash": "a" * 64}
+    payload = canonical.write_w5_handoff_payload(
+        output_root=output_root,
+        acceptance_report=report,
+        deployment_root=output_root / "deployment",
+    )
+    root = Path(payload["deployment_root"])
+    assert "staging" not in str(root)
+    assert root == (output_root / "deployment").resolve()
+    assert root.is_dir()
+    loaded = __import__("json").loads((output_root / "w5_handoff.json").read_text(encoding="utf-8"))
+    assert Path(loaded["deployment_root"]) == root
+
+
+def test_preaccept_receipt_requires_both_rank_resume_equivalence():
+    """R4: exact_resume=passed alone is insufficient without both-rank proof."""
+
+    with pytest.raises(ValueError, match="uninterrupted_versus_resumed"):
+        canonical.require_preaccept_exact_resume_receipt(
+            {
+                "exact_resume": "passed",
+                "two_rank_step": "passed",
+                "world_size": 2,
+            }
+        )
+    ok = canonical.require_preaccept_exact_resume_receipt(
+        {
+            "exact_resume": "passed",
+            "two_rank_step": "passed",
+            "world_size": 2,
+            "uninterrupted_versus_resumed": "passed",
+            "ranks_restored": [0, 1],
+            "resume_equivalence": {
+                "rank0_loss_match": True,
+                "rank1_loss_match": True,
+                "gradient_fingerprint_match": True,
+            },
+        }
+    )
+    assert ok["uninterrupted_versus_resumed"] == "passed"
+
+
+def test_finalize_published_package_rejects_missing_indexed_payloads(tmp_path):
+    """R2: accepted marker cannot seal a package missing indexed .pt payloads."""
+
+    root = tmp_path / "deployment"
+    root.mkdir()
+    (root / "metadata.json").write_text('{"schema":"x"}\n', encoding="utf-8")
+    (root / "ACCEPTED_W3_DEPLOYMENT").write_text("recorded_data_offline_only\n", encoding="utf-8")
+    (root / "content_index.json").write_text(
+        '{"schema":"osx_cover_w3_content_index_v1","files":{"model.pt":"'
+        + "a" * 64
+        + '","metadata.json":"'
+        + "b" * 64
+        + '","ACCEPTED_W3_DEPLOYMENT":"'
+        + "c" * 64
+        + '"},"content_hash":"'
+        + "d" * 64
+        + '"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"does not match bundle files|missing file on disk|model\.pt"):
+        canonical.require_published_deployment_payloads(root)
+
+
 def _protocol_evidence() -> dict:
     return {
         "protocol": {
@@ -149,7 +221,20 @@ def test_canonical_accept_requires_preaccept_gates_before_full_train(tmp_path, m
     monkeypatch.setattr(
         pipeline,
         "run_preaccept_two_rank_step_and_resume",
-        lambda **_: calls.append("preaccept") or {"two_rank_step": "passed", "exact_resume": "passed"},
+        lambda **_: (
+            calls.append("preaccept")
+            or {
+                "two_rank_step": "passed",
+                "exact_resume": "passed",
+                "uninterrupted_versus_resumed": "passed",
+                "ranks_restored": [0, 1],
+                "resume_equivalence": {
+                    "rank0_loss_match": True,
+                    "rank1_loss_match": True,
+                    "gradient_fingerprint_match": True,
+                },
+            }
+        ),
     )
     monkeypatch.setattr(pipeline, "validate_protocol_directory", lambda *a, **k: _protocol_evidence())
     monkeypatch.setattr(pipeline, "W2DatasetGateway", lambda *a, **k: _gateway())
@@ -188,7 +273,17 @@ def test_failed_usefulness_publishes_no_accepted_marker(tmp_path, monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "run_preaccept_two_rank_step_and_resume",
-        lambda **_: {"two_rank_step": "passed", "exact_resume": "passed"},
+        lambda **_: {
+            "two_rank_step": "passed",
+            "exact_resume": "passed",
+            "uninterrupted_versus_resumed": "passed",
+            "ranks_restored": [0, 1],
+            "resume_equivalence": {
+                "rank0_loss_match": True,
+                "rank1_loss_match": True,
+                "gradient_fingerprint_match": True,
+            },
+        },
     )
     monkeypatch.setattr(pipeline, "validate_protocol_directory", lambda *a, **k: _protocol_evidence())
     monkeypatch.setattr(pipeline, "W2DatasetGateway", lambda *a, **k: _gateway())
@@ -258,7 +353,17 @@ def test_successful_canonical_accept_sets_canonical_scope_and_offline_authority(
     monkeypatch.setattr(
         pipeline,
         "run_preaccept_two_rank_step_and_resume",
-        lambda **_: {"two_rank_step": "passed", "exact_resume": "passed"},
+        lambda **_: {
+            "two_rank_step": "passed",
+            "exact_resume": "passed",
+            "uninterrupted_versus_resumed": "passed",
+            "ranks_restored": [0, 1],
+            "resume_equivalence": {
+                "rank0_loss_match": True,
+                "rank1_loss_match": True,
+                "gradient_fingerprint_match": True,
+            },
+        },
     )
     monkeypatch.setattr(pipeline, "validate_protocol_directory", lambda *a, **k: _protocol_evidence())
     monkeypatch.setattr(pipeline, "W2DatasetGateway", lambda *a, **k: _gateway())
@@ -371,8 +476,8 @@ def test_successful_canonical_accept_sets_canonical_scope_and_offline_authority(
     )
     monkeypatch.setattr(
         pipeline,
-        "write_w5_handoff_payload",
-        lambda **kwargs: {"handoff_status": "READY_FOR_W5", "authority": "recorded_data_offline_integration_only"},
+        "require_published_deployment_payloads",
+        lambda root: {"root": str(root), "payloads_present": True},
     )
 
     final = pipeline.run_canonical_acceptance(
@@ -393,3 +498,6 @@ def test_successful_canonical_accept_sets_canonical_scope_and_offline_authority(
     assert final["evaluation"]["repeated_byte_identical"] is True
     assert ablation_seen["two_view_report"]["row_metrics"]["sample_ids"] == ["s0"]
     assert ablation_seen["two_view_identity"]["sample_ids"] == ["s0"]
+    handoff = __import__("json").loads((output / "w5_handoff.json").read_text(encoding="utf-8"))
+    assert "staging" not in handoff["deployment_root"]
+    assert Path(handoff["deployment_root"]).resolve() == (output / "deployment").resolve()

@@ -1,23 +1,23 @@
 """W3-09 canonical two-rank DDP training and acceptance helpers."""
 
+# ruff: noqa: PLC0415
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 from typing import Any
-from typing import Mapping
 
 import numpy as np
 import torch
 
 from lap.verifiers.cover.batch_probe import validate_successful_rank_records
-from lap.verifiers.cover.bridge_audit import apply_audited_initialization
-from lap.verifiers.cover.bridge_audit import audit_bridge_checkpoint
 from lap.verifiers.cover.bridge_audit import _target_inventory_from_model
+from lap.verifiers.cover.bridge_audit import audit_bridge_checkpoint
 from lap.verifiers.cover.checkpoint import load_deployment_bundle
 from lap.verifiers.cover.data import TwoViewDataset
 from lap.verifiers.cover.data import W2DatasetGateway
@@ -28,8 +28,8 @@ from lap.verifiers.cover.evaluator import require_explicit_best_checkpoint
 from lap.verifiers.cover.model import OpenClipSigLIP2Backbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
-from lap.verifiers.cover.protocol import RunProtocol
 from lap.verifiers.cover.protocol import WORLD_SIZE
+from lap.verifiers.cover.protocol import RunProtocol
 from lap.verifiers.cover.protocol import snapshot_nvidia_devices
 from lap.verifiers.cover.protocol import validate_protocol_directory
 from lap.verifiers.cover.training import base_only_config_delta
@@ -265,18 +265,16 @@ def _run_preaccept_checkpoint_resume(
         timeout_seconds=timeout_seconds,
     )
     if not result_path.is_file():
-        error_bits = []
-        for path in sorted(Path(work_dir).glob("preaccept_worker_error_rank*.txt")):
-            error_bits.append(f"{path.name}:\n{path.read_text(encoding='utf-8')[-4000:]}")
+        error_bits = [
+            f"{path.name}:\n{path.read_text(encoding='utf-8')[-4000:]}"
+            for path in sorted(Path(work_dir).glob("preaccept_worker_error_rank*.txt"))
+        ]
         detail = "\n".join(error_bits) if error_bits else completed.stderr[-2000:]
         raise RuntimeError(
-            "canonical preaccept checkpoint worker did not emit a result "
-            f"(exit={completed.returncode}): {detail}"
+            f"canonical preaccept checkpoint worker did not emit a result (exit={completed.returncode}): {detail}"
         )
     receipt = json.loads(result_path.read_text(encoding="utf-8"))
-    if receipt.get("exact_resume") != "passed":
-        raise RuntimeError(f"canonical preaccept exact resume failed: {receipt}")
-    return receipt
+    return require_preaccept_exact_resume_receipt(receipt)
 
 
 def run_preaccept_two_rank_step_and_resume(
@@ -311,15 +309,20 @@ def run_preaccept_two_rank_step_and_resume(
         work_dir=work,
         validator_path=resolved_validator,
     )
-    return {
-        "two_rank_step": "passed",
-        "exact_resume": "passed",
-        "host": host,
-        "per_rank_batch_size": _CANONICAL_PER_RANK_BATCH,
-        "world_size": WORLD_SIZE,
-        "ddp_step_ranks": ddp_ranks,
-        "checkpoint_resume": checkpoint_receipt,
-    }
+    return require_preaccept_exact_resume_receipt(
+        {
+            "two_rank_step": "passed",
+            "exact_resume": "passed",
+            "uninterrupted_versus_resumed": checkpoint_receipt.get("uninterrupted_versus_resumed"),
+            "ranks_restored": checkpoint_receipt.get("ranks_restored"),
+            "resume_equivalence": checkpoint_receipt.get("resume_equivalence"),
+            "host": host,
+            "per_rank_batch_size": _CANONICAL_PER_RANK_BATCH,
+            "world_size": WORLD_SIZE,
+            "ddp_step_ranks": ddp_ranks,
+            "checkpoint_resume": checkpoint_receipt,
+        }
+    )
 
 
 def train_two_rank_ddp(
@@ -372,13 +375,13 @@ def train_two_rank_ddp(
         timeout_seconds=172800,
     )
     if not result_path.is_file():
-        error_bits: list[str] = []
-        for path in sorted(Path(checkpoint).glob("train_worker_error_rank*.txt")):
-            error_bits.append(f"{path.name}:\n{path.read_text(encoding='utf-8')[-4000:]}")
+        error_bits = [
+            f"{path.name}:\n{path.read_text(encoding='utf-8')[-4000:]}"
+            for path in sorted(Path(checkpoint).glob("train_worker_error_rank*.txt"))
+        ]
         detail = "\n".join(error_bits) if error_bits else completed.stderr[-2000:]
         raise RuntimeError(
-            "canonical DDP training worker did not emit train_result.json "
-            f"(exit={completed.returncode}): {detail}"
+            f"canonical DDP training worker did not emit train_result.json (exit={completed.returncode}): {detail}"
         )
     receipt = json.loads(result_path.read_text(encoding="utf-8"))
     if receipt.get("gradient_synchronization") != "two_rank_ddp":
@@ -431,9 +434,7 @@ def run_matched_base_only_two_rank_ddp(
         backbone = OpenClipSigLIP2Backbone(pretrained="hf-hub:timm/ViT-L-16-SigLIP2-384")
     else:
         backbone = two_view_model.backbone
-    base_config = make_base_only_config(
-        two_view_model.config if two_view_model is not None else VerifierConfig()
-    )
+    base_config = make_base_only_config(two_view_model.config if two_view_model is not None else VerifierConfig())
     base_model = VerifierModel(base_config, backbone)
     # Trained base-only weights come from the DDP worker checkpoint; do not
     # re-apply the two-view production audit onto the wrist-omitted inventory.
@@ -660,6 +661,45 @@ def load_deployment_bundle_for_acceptance(
     }
 
 
+def require_preaccept_exact_resume_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Require W3-06-compatible both-rank uninterrupted-versus-resumed proof."""
+
+    payload = dict(receipt)
+    if payload.get("exact_resume") != "passed":
+        raise ValueError(f"canonical preaccept exact resume failed: {payload}")
+    if payload.get("uninterrupted_versus_resumed") != "passed":
+        raise ValueError(
+            "canonical preaccept missing uninterrupted_versus_resumed=passed "
+            f"(both-rank continuation proof required): {payload}"
+        )
+    ranks = payload.get("ranks_restored")
+    if list(ranks or []) != [0, 1]:
+        raise ValueError(f"canonical preaccept must restore ranks [0, 1]: {payload}")
+    equivalence = payload.get("resume_equivalence")
+    if not isinstance(equivalence, Mapping):
+        raise ValueError("canonical preaccept missing resume_equivalence evidence")
+    for key in ("rank0_loss_match", "rank1_loss_match", "gradient_fingerprint_match"):
+        if equivalence.get(key) is not True:
+            raise ValueError(f"canonical preaccept resume equivalence failed at {key}: {payload}")
+    return payload
+
+
+def require_published_deployment_payloads(root: Path) -> dict[str, Any]:
+    """Fail closed when an accepted deployment is missing indexed on-disk payloads."""
+
+    from lap.verifiers.cover.checkpoint import _validate_deployment_content_index
+
+    root = Path(root)
+    index_path = root / "content_index.json"
+    if not index_path.is_file():
+        raise ValueError(f"deployment content index missing: {index_path}")
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    _validate_deployment_content_index(root, index)
+    if not (root / "model.pt").is_file():
+        raise ValueError("deployment content index missing file on disk: model.pt")
+    return {"root": str(root.resolve()), "payloads_present": True}
+
+
 def write_w5_handoff_payload(
     *,
     output_root: Path,
@@ -668,8 +708,23 @@ def write_w5_handoff_payload(
 ) -> dict[str, Any]:
     """Write the compact W3→W5 handoff consumed by downstream integration."""
 
-    output_root = Path(output_root)
+    output_root = Path(output_root).resolve()
+    deployment_root = Path(deployment_root).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    if "staging" in deployment_root.parts:
+        raise ValueError(
+            "w5 handoff deployment_root must name the final published deployment, "
+            f"not a staging path: {deployment_root}"
+        )
+    if not deployment_root.is_dir():
+        raise ValueError(f"w5 handoff deployment_root does not exist: {deployment_root}")
+    try:
+        deployment_root.relative_to(output_root)
+    except ValueError as error:
+        raise ValueError(
+            "w5 handoff deployment_root must resolve under the published package root: "
+            f"{deployment_root} not in {output_root}"
+        ) from error
     payload = {
         "schema": "osx_cover_w3_to_w5_handoff_v1",
         "handoff_status": "READY_FOR_W5",

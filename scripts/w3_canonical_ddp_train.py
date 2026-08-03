@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Two-rank DDP training worker for canonical W3-09 acceptance."""
 
+# ruff: noqa: E402,PLC0415,PLW0603
 from __future__ import annotations
 
 import os
@@ -52,8 +53,8 @@ from lap.verifiers.cover.data import make_sampler
 from lap.verifiers.cover.model import OpenClipSigLIP2Backbone
 from lap.verifiers.cover.model import VerifierConfig
 from lap.verifiers.cover.model import VerifierModel
-from lap.verifiers.cover.protocol import RunProtocol
 from lap.verifiers.cover.protocol import WORLD_SIZE
+from lap.verifiers.cover.protocol import RunProtocol
 from lap.verifiers.cover.training import create_optimizer
 from lap.verifiers.cover.training import make_base_only_config
 from lap.verifiers.cover.w3_contracts import canonical_bytes
@@ -86,7 +87,7 @@ def _seed_everything(seed: int) -> None:
 
 
 def _resolve_pinned_snapshot() -> Path:
-    from huggingface_hub import snapshot_download  # noqa: PLC0415
+    from huggingface_hub import snapshot_download
 
     from lap.verifiers.cover.w3_contracts import BACKBONE_ID
     from lap.verifiers.cover.w3_contracts import BACKBONE_REVISION
@@ -230,7 +231,6 @@ def _init_ddp() -> int:
     return rank
 
 
-
 def _ddp_train_step(
     ddp_model: DistributedDataParallel,
     base_model: VerifierModel,
@@ -316,6 +316,21 @@ def _exit_worker(*, exit_code: int, process_group: bool) -> None:
     os._exit(exit_code)
 
 
+def _gather_objects(local: Any) -> list[Any]:
+    import torch.distributed as dist
+
+    global _GLOO_GROUP
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    if _GLOO_GROUP is None:
+        _GLOO_GROUP = dist.new_group(backend="gloo")
+    gathered: list[Any | None] = [None] * world_size
+    dist.gather_object(local, gathered if rank == 0 else None, dst=0, group=_GLOO_GROUP)
+    if rank != 0:
+        return []
+    return [item for item in gathered if item is not None]
+
+
 def run_preaccept_worker(
     *,
     w2_root: Path,
@@ -325,6 +340,10 @@ def run_preaccept_worker(
     result_path: Path,
     validator_path: Path | None,
 ) -> None:
+    """Fresh two-rank step, then both-rank W3-06 exact resume with continuation equivalence."""
+
+    from lap.verifiers.cover.batch_probe import _parameter_fingerprint
+
     rank = int(os.environ["LOCAL_RANK"])
     process_group = False
     exit_code = 0
@@ -359,15 +378,14 @@ def run_preaccept_worker(
             collate_fn=collate_two_view_batch,
             num_workers=0,
         )
-        batch = next(iter(loader))
-        device_batch = {
-            key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()
-        }
+        iterator = iter(loader)
+        batch1 = next(iterator)
+        device_batch1 = {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch1.items()}
         optimizer, scheduler = create_optimizer(base_model, protocol)
-        metrics = _ddp_train_step(
+        _ddp_train_step(
             ddp_model,
             base_model,
-            device_batch,
+            device_batch1,
             optimizer,
             clip_norm=protocol.gradient_clip_norm,
         )
@@ -382,13 +400,15 @@ def run_preaccept_worker(
         cuda_rng_device_count = contract["environment"]["cuda_rng_device_count"]
         torch.distributed.barrier()
         rng_states = _gather_rng_states(cuda_rng_device_count=cuda_rng_device_count)
-        # Destroy NCCL before multi-minute rank-0 checkpoint I/O.
-        torch.distributed.barrier()
-        _destroy_process_group_quiet()
-        process_group = False
+        checkpoint_path = Path(result_path).parent / "preaccept_checkpoint.pt"
         if rank == 0:
-            progress = build_progress(epoch=1, global_step=1, best_metric=float(metrics["loss"]), world_size=WORLD_SIZE)
-            checkpoint_path = result_path.parent / "preaccept_checkpoint.pt"
+            progress = build_progress(
+                epoch=1,
+                global_step=1,
+                best_metric=0.0,
+                world_size=WORLD_SIZE,
+            )
+            # Rank-0 write uses gathered RNG for both ranks; sampler_state is rank-local metadata.
             save_training_checkpoint(
                 checkpoint_path,
                 model=base_model,
@@ -400,18 +420,84 @@ def run_preaccept_worker(
                 rank=0,
                 rng_states=rng_states,
             )
-            load_training_checkpoint(
-                checkpoint_path,
-                model=base_model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                expected_contract=contract,
-                rank=0,
-            )
+        torch.distributed.barrier()
+
+        batch2 = next(iterator)
+        device_batch2 = {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch2.items()}
+        metrics_uninterrupted = _ddp_train_step(
+            ddp_model,
+            base_model,
+            device_batch2,
+            optimizer,
+            clip_norm=protocol.gradient_clip_norm,
+        )
+        fingerprint_uninterrupted = _parameter_fingerprint(base_model, trainable=True)
+        torch.distributed.barrier()
+
+        loaded = load_training_checkpoint(
+            checkpoint_path,
+            model=base_model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            expected_contract=contract,
+            rank=rank,
+        )
+        restored_sampler = make_sampler(
+            train_dataset,
+            seed=protocol.sampler_seed,
+            world_size=WORLD_SIZE,
+            rank=rank,
+        )
+        restored_sampler.set_epoch(int(loaded["sampler_state"]["epoch"]))
+        metrics_resumed = _ddp_train_step(
+            ddp_model,
+            base_model,
+            device_batch2,
+            optimizer,
+            clip_norm=protocol.gradient_clip_norm,
+        )
+        fingerprint_resumed = _parameter_fingerprint(base_model, trainable=True)
+        local_evidence = {
+            "rank": rank,
+            "loss_uninterrupted": float(metrics_uninterrupted["loss"]),
+            "loss_resumed": float(metrics_resumed["loss"]),
+            "loss_match": float(metrics_uninterrupted["loss"]) == float(metrics_resumed["loss"]),
+            "gradient_norm_uninterrupted": float(metrics_uninterrupted["gradient_norm"]),
+            "gradient_norm_resumed": float(metrics_resumed["gradient_norm"]),
+            "parameter_fingerprint_uninterrupted": fingerprint_uninterrupted,
+            "parameter_fingerprint_resumed": fingerprint_resumed,
+            "parameter_fingerprint_match": fingerprint_uninterrupted == fingerprint_resumed,
+            "sampler_epoch_restored": int(loaded["sampler_state"]["epoch"]),
+        }
+        gathered = _gather_objects(local_evidence)
+        torch.distributed.barrier()
+        _destroy_process_group_quiet()
+        process_group = False
+        if rank == 0:
+            by_rank = {int(item["rank"]): item for item in gathered}
+            if set(by_rank) != {0, 1}:
+                raise RuntimeError(f"preaccept resume did not restore both ranks: {sorted(by_rank)}")
+            loss_matches = {rank_id: bool(item["loss_match"]) for rank_id, item in by_rank.items()}
+            fingerprint_matches = {
+                rank_id: bool(item["parameter_fingerprint_match"]) for rank_id, item in by_rank.items()
+            }
+            if not all(loss_matches.values()) or not all(fingerprint_matches.values()):
+                raise RuntimeError(
+                    "preaccept uninterrupted-versus-resumed mismatch: "
+                    f"loss={loss_matches} fingerprints={fingerprint_matches}"
+                )
             receipt = {
                 "schema": "osx_cover_w3_preaccept_checkpoint_v1",
                 "two_rank_step": "passed",
                 "exact_resume": "passed",
+                "uninterrupted_versus_resumed": "passed",
+                "ranks_restored": [0, 1],
+                "resume_equivalence": {
+                    "rank0_loss_match": loss_matches[0],
+                    "rank1_loss_match": loss_matches[1],
+                    "gradient_fingerprint_match": all(fingerprint_matches.values()),
+                },
+                "rank_evidence": by_rank,
                 "checkpoint": str(checkpoint_path),
                 "world_size": WORLD_SIZE,
                 "per_rank_batch_size": protocol.per_rank_batch_size,
