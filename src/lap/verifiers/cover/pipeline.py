@@ -25,6 +25,7 @@ from lap.verifiers.cover.canonical import run_matched_base_only_two_rank_ddp
 from lap.verifiers.cover.canonical import run_preaccept_two_rank_step_and_resume
 from lap.verifiers.cover.canonical import run_repeated_fixed_best_evaluation
 from lap.verifiers.cover.canonical import train_two_rank_ddp
+from lap.verifiers.cover.canonical import write_and_validate_package_identity
 from lap.verifiers.cover.canonical import write_w5_handoff_payload
 from lap.verifiers.cover.checkpoint import build_checkpoint_contract
 from lap.verifiers.cover.checkpoint import build_four_state_inventory
@@ -861,6 +862,14 @@ def run_canonical_acceptance(
     """Run the complete canonical path; publication occurs only after acceptance."""
 
     del device  # canonical acceptance always uses the locked two-rank CUDA host
+    from datetime import datetime
+    import socket
+    import subprocess
+
+    from lap.verifiers.cover.command import _git_revision
+
+    output_root = Path(output_root)
+    accept_started = datetime.now().astimezone().isoformat(timespec="seconds")
     receipt = preflight_w3(
         w2_root=w2_root,
         bridge_artifact=bridge_artifact,
@@ -874,6 +883,7 @@ def run_canonical_acceptance(
     if staging.exists():
         raise FileExistsError(staging)
     staging.mkdir(parents=True)
+    published = False
     try:
         preaccept = require_preaccept_exact_resume_receipt(
             run_preaccept_two_rank_step_and_resume(
@@ -1035,15 +1045,38 @@ def run_canonical_acceptance(
         final_report["content_hash"] = content_hash(final_report)
         (staging / "acceptance.json").write_bytes(canonical_bytes(final_report) + b"\n")
         staging.rename(output_root)
-        require_published_deployment_payloads(Path(output_root) / "deployment")
-        write_w5_handoff_payload(
-            output_root=Path(output_root),
-            acceptance_report=final_report,
-            deployment_root=Path(output_root) / "deployment",
-        )
+        published = True
+        try:
+            require_published_deployment_payloads(Path(output_root) / "deployment")
+            write_w5_handoff_payload(
+                output_root=Path(output_root),
+                acceptance_report=final_report,
+                deployment_root=Path(output_root) / "deployment",
+            )
+            try:
+                execution_source = _git_revision(Path(__file__).resolve().parents[4])
+            except (OSError, subprocess.CalledProcessError, AttributeError):
+                execution_source = "unknown"
+            accept_ended = datetime.now().astimezone().isoformat(timespec="seconds")
+            write_and_validate_package_identity(
+                package_root=Path(output_root),
+                host_run={
+                    "host": socket.gethostname(),
+                    "execution_source_commit": execution_source,
+                    "start": accept_started,
+                    "end": accept_ended,
+                },
+            )
+        except Exception:
+            evidence_dir = Path(output_root).parent / "evidence"
+            _preserve_failure_evidence(Path(output_root), evidence_dir)
+            if Path(output_root).exists():
+                shutil.rmtree(Path(output_root))
+            raise
     except Exception:
-        evidence_dir = Path(output_root).parent / "evidence"
-        _preserve_failure_evidence(staging, evidence_dir)
-        _cleanup_staging(staging)
+        if not published:
+            evidence_dir = Path(output_root).parent / "evidence"
+            _preserve_failure_evidence(staging, evidence_dir)
+            _cleanup_staging(staging)
         raise
     return final_report

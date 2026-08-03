@@ -37,6 +37,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
 from lap.verifiers.cover.bridge_audit import apply_audited_initialization
+from lap.verifiers.cover.canonical import next_batch_after_resume
 from lap.verifiers.cover.canonical import resolve_initialization_manifest_for_model
 from lap.verifiers.cover.checkpoint import build_checkpoint_contract
 from lap.verifiers.cover.checkpoint import build_four_state_inventory
@@ -401,6 +402,7 @@ def run_preaccept_worker(
         torch.distributed.barrier()
         rng_states = _gather_rng_states(cuda_rng_device_count=cuda_rng_device_count)
         checkpoint_path = Path(result_path).parent / "preaccept_checkpoint.pt"
+        local_sampler_state = {"epoch": 0, "rank": rank, "world_size": WORLD_SIZE}
         if rank == 0:
             progress = build_progress(
                 epoch=1,
@@ -408,7 +410,7 @@ def run_preaccept_worker(
                 best_metric=0.0,
                 world_size=WORLD_SIZE,
             )
-            # Rank-0 write uses gathered RNG for both ranks; sampler_state is rank-local metadata.
+            # Shared W3-06 sampler_state carries epoch/world_size; per-rank rank is restored locally.
             save_training_checkpoint(
                 checkpoint_path,
                 model=base_model,
@@ -424,6 +426,7 @@ def run_preaccept_worker(
 
         batch2 = next(iterator)
         device_batch2 = {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch2.items()}
+        uninterrupted_sample_ids = list(batch2["sample_ids"])
         metrics_uninterrupted = _ddp_train_step(
             ddp_model,
             base_model,
@@ -442,17 +445,26 @@ def run_preaccept_worker(
             expected_contract=contract,
             rank=rank,
         )
-        restored_sampler = make_sampler(
-            train_dataset,
+        batches_already_consumed = int(loaded["progress"]["global_step"])
+        restored_epoch = int(loaded["sampler_state"]["epoch"])
+        resumed_batch = next_batch_after_resume(
+            dataset=train_dataset,
             seed=protocol.sampler_seed,
             world_size=WORLD_SIZE,
             rank=rank,
+            epoch=restored_epoch,
+            batches_already_consumed=batches_already_consumed,
+            batch_size=protocol.per_rank_batch_size,
+            collate_fn=collate_two_view_batch,
         )
-        restored_sampler.set_epoch(int(loaded["sampler_state"]["epoch"]))
+        device_batch_resumed = {
+            key: value.to(device) if torch.is_tensor(value) else value for key, value in resumed_batch.items()
+        }
+        resumed_sample_ids = list(resumed_batch["sample_ids"])
         metrics_resumed = _ddp_train_step(
             ddp_model,
             base_model,
-            device_batch2,
+            device_batch_resumed,
             optimizer,
             clip_norm=protocol.gradient_clip_norm,
         )
@@ -467,7 +479,12 @@ def run_preaccept_worker(
             "parameter_fingerprint_uninterrupted": fingerprint_uninterrupted,
             "parameter_fingerprint_resumed": fingerprint_resumed,
             "parameter_fingerprint_match": fingerprint_uninterrupted == fingerprint_resumed,
-            "sampler_epoch_restored": int(loaded["sampler_state"]["epoch"]),
+            "sampler_state_local": local_sampler_state,
+            "sampler_epoch_restored": restored_epoch,
+            "sampler_batches_skipped": batches_already_consumed,
+            "uninterrupted_sample_ids": uninterrupted_sample_ids,
+            "resumed_sample_ids": resumed_sample_ids,
+            "next_batch_sample_ids_match": uninterrupted_sample_ids == resumed_sample_ids,
         }
         gathered = _gather_objects(local_evidence)
         torch.distributed.barrier()
@@ -481,10 +498,17 @@ def run_preaccept_worker(
             fingerprint_matches = {
                 rank_id: bool(item["parameter_fingerprint_match"]) for rank_id, item in by_rank.items()
             }
-            if not all(loss_matches.values()) or not all(fingerprint_matches.values()):
+            sample_id_matches = {
+                rank_id: bool(item["next_batch_sample_ids_match"]) for rank_id, item in by_rank.items()
+            }
+            if (
+                not all(loss_matches.values())
+                or not all(fingerprint_matches.values())
+                or not all(sample_id_matches.values())
+            ):
                 raise RuntimeError(
                     "preaccept uninterrupted-versus-resumed mismatch: "
-                    f"loss={loss_matches} fingerprints={fingerprint_matches}"
+                    f"loss={loss_matches} fingerprints={fingerprint_matches} sample_ids={sample_id_matches}"
                 )
             receipt = {
                 "schema": "osx_cover_w3_preaccept_checkpoint_v1",
@@ -496,6 +520,7 @@ def run_preaccept_worker(
                     "rank0_loss_match": loss_matches[0],
                     "rank1_loss_match": loss_matches[1],
                     "gradient_fingerprint_match": all(fingerprint_matches.values()),
+                    "next_batch_sample_ids_match": all(sample_id_matches.values()),
                 },
                 "rank_evidence": by_rank,
                 "checkpoint": str(checkpoint_path),

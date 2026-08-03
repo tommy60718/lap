@@ -6,9 +6,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
 
 from lap.verifiers.cover import canonical
 from lap.verifiers.cover import pipeline
+from lap.verifiers.cover.data import make_sampler
+from lap.verifiers.cover.w3_contracts import content_hash
 
 
 def test_resolve_initialization_manifest_reaudits_base_only_inventory(monkeypatch):
@@ -110,6 +114,21 @@ def test_preaccept_receipt_requires_both_rank_resume_equivalence():
                 "world_size": 2,
             }
         )
+    with pytest.raises(ValueError, match="next_batch_sample_ids_match"):
+        canonical.require_preaccept_exact_resume_receipt(
+            {
+                "exact_resume": "passed",
+                "two_rank_step": "passed",
+                "world_size": 2,
+                "uninterrupted_versus_resumed": "passed",
+                "ranks_restored": [0, 1],
+                "resume_equivalence": {
+                    "rank0_loss_match": True,
+                    "rank1_loss_match": True,
+                    "gradient_fingerprint_match": True,
+                },
+            }
+        )
     ok = canonical.require_preaccept_exact_resume_receipt(
         {
             "exact_resume": "passed",
@@ -121,10 +140,245 @@ def test_preaccept_receipt_requires_both_rank_resume_equivalence():
                 "rank0_loss_match": True,
                 "rank1_loss_match": True,
                 "gradient_fingerprint_match": True,
+                "next_batch_sample_ids_match": True,
             },
         }
     )
     assert ok["uninterrupted_versus_resumed"] == "passed"
+    assert ok["resume_equivalence"]["next_batch_sample_ids_match"] is True
+
+
+def test_restored_sampler_next_batch_matches_uninterrupted_continuation():
+    """R4: resume consumes restored per-rank sampler cursor; not a pre-restore cache."""
+
+    class _IdDataset(Dataset):
+        def __len__(self) -> int:
+            return 32
+
+        def __getitem__(self, index: int) -> dict:
+            return {"sample_id": f"s{index}", "x": index}
+
+    def _collate(rows: list[dict]) -> dict:
+        return {"sample_ids": [row["sample_id"] for row in rows], "xs": [row["x"] for row in rows]}
+
+    dataset = _IdDataset()
+    sampler = make_sampler(dataset, seed=42, world_size=2, rank=1)
+    sampler.set_epoch(0)
+    loader = DataLoader(dataset, batch_size=4, sampler=sampler, collate_fn=_collate)
+    iterator = iter(loader)
+    _ = next(iterator)
+    uninterrupted_ids = next(iterator)["sample_ids"]
+
+    resumed_ids = canonical.next_batch_sample_ids_after_resume(
+        dataset=dataset,
+        seed=42,
+        world_size=2,
+        rank=1,
+        epoch=0,
+        batches_already_consumed=1,
+        batch_size=4,
+        collate_fn=_collate,
+    )
+    assert resumed_ids == uninterrupted_ids
+    assert resumed_ids != []
+
+
+def test_package_identity_rejects_missing_and_stale_entries(tmp_path):
+    """R2: PACKAGE_IDENTITY must independently match every path/size/full SHA256."""
+
+    root = tmp_path / "canonical_acceptance_v1"
+    root.mkdir()
+    payload = root / "acceptance.json"
+    payload.write_text('{"ok":true}\n', encoding="utf-8")
+    (root / "deployment").mkdir()
+    (root / "deployment" / "marker.txt").write_text("m\n", encoding="utf-8")
+
+    sealed = canonical.write_and_validate_package_identity(
+        package_root=root,
+        host_run={"execution_source_commit": "abc", "host": "test"},
+    )
+    assert sealed["schema"] == "osx_cover_w3_09_package_identity_v1"
+    assert "acceptance.json" in sealed["files"]
+
+    identity_path = root / "PACKAGE_IDENTITY.json"
+    stale = __import__("json").loads(identity_path.read_text(encoding="utf-8"))
+    stale["files"]["acceptance.json"]["sha256"] = "0" * 64
+    identity_path.write_text(__import__("json").dumps(stale) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"stale|sha256|mismatch"):
+        canonical.validate_package_identity(root)
+
+    resealed = canonical.write_and_validate_package_identity(
+        package_root=root,
+        host_run={"execution_source_commit": "abc", "host": "test"},
+    )
+    assert resealed["files"]["acceptance.json"]["sha256"] != "0" * 64
+    missing = __import__("json").loads(identity_path.read_text(encoding="utf-8"))
+    missing["files"]["ghost.bin"] = {"sha256": "1" * 64, "size": 1}
+    del missing["content_hash"]
+    missing["content_hash"] = content_hash(missing)
+    identity_path.write_text(__import__("json").dumps(missing) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"missing|ghost\.bin"):
+        canonical.validate_package_identity(root)
+
+
+def test_handoff_failure_after_rename_rolls_back_accepted_marker(tmp_path, monkeypatch):
+    """R3: post-rename handoff/validation failure must leave no ACCEPTED package."""
+
+    output = tmp_path / "accepted"
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(
+        '{"manifest_sha256":"'
+        + "a" * 64
+        + '","artifact":{"sha256":"'
+        + "b" * 64
+        + '"},"target":{"fingerprint":"'
+        + "c" * 64
+        + '"}}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(pipeline, "preflight_w3", lambda **_: {"schema": "preflight", "content_hash": "p" * 64})
+    monkeypatch.setattr(
+        pipeline, "require_canonical_training_host", lambda: {"gpus": ["NVIDIA RTX 6000 Ada Generation"] * 2}
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "run_preaccept_two_rank_step_and_resume",
+        lambda **_: {
+            "two_rank_step": "passed",
+            "exact_resume": "passed",
+            "uninterrupted_versus_resumed": "passed",
+            "ranks_restored": [0, 1],
+            "resume_equivalence": {
+                "rank0_loss_match": True,
+                "rank1_loss_match": True,
+                "gradient_fingerprint_match": True,
+                "next_batch_sample_ids_match": True,
+            },
+        },
+    )
+    monkeypatch.setattr(pipeline, "validate_protocol_directory", lambda *a, **k: _protocol_evidence())
+    monkeypatch.setattr(pipeline, "W2DatasetGateway", lambda *a, **k: _gateway())
+    monkeypatch.setattr(
+        pipeline,
+        "protocol_from_validated",
+        lambda payload: pipeline.RunProtocol(per_rank_batch_size=64),
+    )
+
+    def _train(**kwargs):
+        root = Path(kwargs["checkpoint_dir"])
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "best.pt").write_text("best", encoding="utf-8")
+        (root / "latest.pt").write_text("latest", encoding="utf-8")
+        return {
+            "history": [{"epoch": 0, "loss": 0.1}],
+            "progress": {"epoch": 1, "global_step": 10, "best_metric": 0.1, "world_size": 2},
+            "world_size": 2,
+            "gradient_synchronization": "two_rank_ddp",
+        }
+
+    report = {
+        "retrieval": {
+            "semantic_to_action_top1_ci95": [0.1, 0.2],
+            "action_to_semantic_top1_ci95": [0.1, 0.2],
+        },
+        "margins": {
+            "aligned_minus_shuffled": {"ci95": [0.01, 0.02]},
+            "aligned_minus_nearby": {"ci95": [0.01, 0.02]},
+        },
+        "pool": {"top1_chance": 1 / 1118},
+        "conditions": {"all_eight": True},
+        "content_hash": "e" * 64,
+    }
+    metrics = {
+        **report,
+        "row_metrics": {
+            "sample_ids": ["s0"],
+            "episode_ids": ["e0"],
+            "semantic_to_action_hit": [1],
+            "action_to_semantic_hit": [1],
+        },
+        "pair_metrics": {
+            "aligned_minus_shuffled": [0.1],
+            "aligned_minus_shuffled_episode_ids": ["e0"],
+            "aligned_minus_nearby": [0.1],
+            "aligned_minus_nearby_episode_ids": ["e0"],
+        },
+    }
+    monkeypatch.setattr(pipeline, "train_two_rank_ddp", _train)
+    monkeypatch.setattr(
+        pipeline,
+        "run_repeated_fixed_best_evaluation",
+        lambda **_: {
+            "report": report,
+            "metrics": metrics,
+            "evaluation_bytes": b'{"ok":true}\n',
+            "repeated_byte_identical": True,
+        },
+    )
+    monkeypatch.setattr(pipeline, "_load_two_view_model_from_best", lambda *a, **k: _fake_model())
+    monkeypatch.setattr(
+        pipeline,
+        "run_matched_base_only_two_rank_ddp",
+        lambda **_: {
+            "model": _fake_model(),
+            "report": {**metrics, "variant": "base_only", "deployable": False, "content_hash": "b" * 64},
+            "identity": {"seed": 42, "sample_ids": ["s0"]},
+            "config_delta": {
+                "use_wrist": {"two_view": True, "base_only": False},
+                "fusion_input_width": {"two_view": 1536, "base_only": 1024},
+            },
+            "model_config": {"use_wrist": False, "embedding_width": 512},
+            "history": [{"epoch": 0, "loss": 0.2}],
+            "progress": {"epoch": 1, "global_step": 10, "best_metric": 0.2, "world_size": 2},
+            "checkpoint_dir": None,
+        },
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "matched_base_only_run_to_paired_ablation_report",
+        lambda **_: {
+            "schema": "osx_cover_w3_paired_ablation_report_v1",
+            "deployable": False,
+            "ablation": {"paired": True},
+            "content_hash": "a" * 64,
+        },
+    )
+
+    def _publish(root, *, model, metadata, accepted_marker=True):
+        Path(root).mkdir(parents=True, exist_ok=True)
+        (Path(root) / "ACCEPTED_W3_DEPLOYMENT").write_text("recorded_data_offline_only\n", encoding="utf-8")
+        (Path(root) / "model.pt").write_bytes(b"pt")
+        (Path(root) / "metadata.json").write_text("{}\n", encoding="utf-8")
+        (Path(root) / "content_index.json").write_text("{}\n", encoding="utf-8")
+        return {"root": str(root)}
+
+    monkeypatch.setattr(pipeline, "publish_deployment_bundle", _publish)
+    monkeypatch.setattr(
+        pipeline, "load_deployment_bundle_for_acceptance", lambda root, **kwargs: {"scores_finite": True}
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "require_published_deployment_payloads",
+        lambda root: {"root": str(root), "payloads_present": True},
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "write_w5_handoff_payload",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("injected handoff failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="injected handoff failure"):
+        pipeline.run_canonical_acceptance(
+            w2_root=tmp_path / "w2",
+            bridge_artifact=tmp_path / "bridge.pt",
+            audit_manifest=audit_path,
+            protocol_dir=tmp_path / "protocol",
+            output_root=output,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob("**/ACCEPTED_W3_DEPLOYMENT"))
 
 
 def test_finalize_published_package_rejects_missing_indexed_payloads(tmp_path):
@@ -232,6 +486,7 @@ def test_canonical_accept_requires_preaccept_gates_before_full_train(tmp_path, m
                     "rank0_loss_match": True,
                     "rank1_loss_match": True,
                     "gradient_fingerprint_match": True,
+                    "next_batch_sample_ids_match": True,
                 },
             }
         ),
@@ -282,6 +537,7 @@ def test_failed_usefulness_publishes_no_accepted_marker(tmp_path, monkeypatch):
                 "rank0_loss_match": True,
                 "rank1_loss_match": True,
                 "gradient_fingerprint_match": True,
+                "next_batch_sample_ids_match": True,
             },
         },
     )
@@ -362,6 +618,7 @@ def test_successful_canonical_accept_sets_canonical_scope_and_offline_authority(
                 "rank0_loss_match": True,
                 "rank1_loss_match": True,
                 "gradient_fingerprint_match": True,
+                "next_batch_sample_ids_match": True,
             },
         },
     )

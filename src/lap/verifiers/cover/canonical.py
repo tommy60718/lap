@@ -678,10 +678,72 @@ def require_preaccept_exact_resume_receipt(receipt: Mapping[str, Any]) -> dict[s
     equivalence = payload.get("resume_equivalence")
     if not isinstance(equivalence, Mapping):
         raise ValueError("canonical preaccept missing resume_equivalence evidence")
-    for key in ("rank0_loss_match", "rank1_loss_match", "gradient_fingerprint_match"):
+    for key in (
+        "rank0_loss_match",
+        "rank1_loss_match",
+        "gradient_fingerprint_match",
+        "next_batch_sample_ids_match",
+    ):
         if equivalence.get(key) is not True:
             raise ValueError(f"canonical preaccept resume equivalence failed at {key}: {payload}")
     return payload
+
+
+def next_batch_after_resume(
+    *,
+    dataset: Any,
+    seed: int,
+    world_size: int,
+    rank: int,
+    epoch: int,
+    batches_already_consumed: int,
+    batch_size: int,
+    collate_fn: Any,
+) -> dict[str, Any]:
+    """Recreate the per-rank sampler and return the next batch after the saved cursor."""
+
+    from torch.utils.data import DataLoader
+
+    from lap.verifiers.cover.data import make_sampler
+
+    if batches_already_consumed < 0:
+        raise ValueError("batches_already_consumed must be >= 0")
+    sampler = make_sampler(dataset, seed=seed, world_size=world_size, rank=rank)
+    sampler.set_epoch(int(epoch))
+    loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, collate_fn=collate_fn, num_workers=0)
+    iterator = iter(loader)
+    for _ in range(int(batches_already_consumed)):
+        next(iterator)
+    return next(iterator)
+
+
+def next_batch_sample_ids_after_resume(
+    *,
+    dataset: Any,
+    seed: int,
+    world_size: int,
+    rank: int,
+    epoch: int,
+    batches_already_consumed: int,
+    batch_size: int,
+    collate_fn: Any,
+) -> list[Any]:
+    """Public helper: sample ids of the first batch after restored sampler cursor."""
+
+    batch = next_batch_after_resume(
+        dataset=dataset,
+        seed=seed,
+        world_size=world_size,
+        rank=rank,
+        epoch=epoch,
+        batches_already_consumed=batches_already_consumed,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+    )
+    sample_ids = batch.get("sample_ids")
+    if not isinstance(sample_ids, list):
+        raise ValueError("restored sampler batch missing sample_ids")
+    return list(sample_ids)
 
 
 def require_published_deployment_payloads(root: Path) -> dict[str, Any]:
@@ -698,6 +760,93 @@ def require_published_deployment_payloads(root: Path) -> dict[str, Any]:
     if not (root / "model.pt").is_file():
         raise ValueError("deployment content index missing file on disk: model.pt")
     return {"root": str(root.resolve()), "payloads_present": True}
+
+
+PACKAGE_IDENTITY_SCHEMA = "osx_cover_w3_09_package_identity_v1"
+_PACKAGE_IDENTITY_NAME = "PACKAGE_IDENTITY.json"
+
+
+def _package_relative_file_map(package_root: Path) -> dict[str, Path]:
+    package_root = Path(package_root).resolve()
+    files: dict[str, Path] = {}
+    for path in sorted(package_root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name == _PACKAGE_IDENTITY_NAME and path.parent == package_root:
+            continue
+        rel = path.relative_to(package_root).as_posix()
+        files[rel] = path
+    return files
+
+
+def validate_package_identity(package_root: Path) -> dict[str, Any]:
+    """Independently re-hash every indexed path; reject missing or stale entries."""
+
+    from lap.verifiers.cover.w3_contracts import sha256_file
+
+    package_root = Path(package_root).resolve()
+    identity_path = package_root / _PACKAGE_IDENTITY_NAME
+    if not identity_path.is_file():
+        raise ValueError(f"PACKAGE_IDENTITY missing: {identity_path}")
+    payload = json.loads(identity_path.read_text(encoding="utf-8"))
+    if payload.get("schema") != PACKAGE_IDENTITY_SCHEMA:
+        raise ValueError(f"PACKAGE_IDENTITY schema mismatch: {payload.get('schema')}")
+    files = payload.get("files")
+    if not isinstance(files, Mapping) or not files:
+        raise ValueError("PACKAGE_IDENTITY files map is empty or invalid")
+    for rel, meta in files.items():
+        if not isinstance(meta, Mapping):
+            raise ValueError(f"PACKAGE_IDENTITY entry invalid: {rel}")
+        path = (package_root / rel).resolve()
+        try:
+            path.relative_to(package_root)
+        except ValueError as error:
+            raise ValueError(f"PACKAGE_IDENTITY path escapes package root: {rel}") from error
+        if not path.is_file():
+            raise ValueError(f"PACKAGE_IDENTITY missing file on disk: {rel}")
+        actual_size = path.stat().st_size
+        expected_size = meta.get("size")
+        if expected_size != actual_size:
+            raise ValueError(f"PACKAGE_IDENTITY stale size for {rel}: expected {expected_size}, actual {actual_size}")
+        actual_sha = sha256_file(path)
+        expected_sha = meta.get("sha256")
+        if expected_sha != actual_sha:
+            raise ValueError(f"PACKAGE_IDENTITY sha256 mismatch (stale) for {rel}")
+    expected_hash = payload.get("content_hash")
+    recomputed = content_hash(dict(payload))
+    if expected_hash != recomputed:
+        raise ValueError("PACKAGE_IDENTITY content_hash mismatch")
+    return payload
+
+
+def write_and_validate_package_identity(
+    *,
+    package_root: Path,
+    host_run: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Generate PACKAGE_IDENTITY only after the package tree is final, then revalidate."""
+
+    from lap.verifiers.cover.w3_contracts import sha256_file
+
+    package_root = Path(package_root).resolve()
+    if not package_root.is_dir():
+        raise ValueError(f"package root missing: {package_root}")
+    identity_path = package_root / _PACKAGE_IDENTITY_NAME
+    if identity_path.exists():
+        identity_path.unlink()
+    file_map = _package_relative_file_map(package_root)
+    if not file_map:
+        raise ValueError(f"package root has no sealable files: {package_root}")
+    files = {rel: {"sha256": sha256_file(path), "size": path.stat().st_size} for rel, path in file_map.items()}
+    payload: dict[str, Any] = {
+        "schema": PACKAGE_IDENTITY_SCHEMA,
+        "package_root": str(package_root),
+        "files": files,
+        "host_run": dict(host_run or {}),
+    }
+    payload["content_hash"] = content_hash(payload)
+    identity_path.write_bytes(canonical_bytes(payload) + b"\n")
+    return validate_package_identity(package_root)
 
 
 def write_w5_handoff_payload(
