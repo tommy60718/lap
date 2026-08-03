@@ -1,0 +1,24 @@
+EXEC_SOURCE=4a9a697e565316236e6712adc17db1c0cd6d5b5c START=2026-08-03T13:50:32+09:00
+/home/yangsen/osx_ur/catkin_ws/src/osx_vla/externals/lap/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+RUNNING_PREACCEPT 4a9a697e565316236e6712adc17db1c0cd6d5b5c
+/home/yangsen/osx_ur/catkin_ws/src/osx_vla/externals/lap/.venv/lib/python3.11/site-packages/torch/nn/modules/transformer.py:382: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.self_attn.batch_first was not True(use batch_first for better inference performance)
+  warnings.warn(
+PREACCEPT_OK passed [0, 1]
+Traceback (most recent call last):
+  File "<stdin>", line 37, in <module>
+KeyError: 'normalization_artifact_hash'
+END=2026-08-03T13:54:24+09:00
+/home/yangsen/osx_ur/catkin_ws/src/osx_vla/externals/lap/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Traceback (most recent call last):
+  File "<stdin>", line 18, in <module>
+TypeError: VerifierConfig.__init__() got an unexpected keyword argument 'backbone_id'
+/home/yangsen/osx_ur/catkin_ws/src/osx_vla/externals/lap/.venv/lib/python3.11/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/home/yangsen/osx_ur/catkin_ws/src/osx_vla/externals/lap/.venv/lib/python3.11/site-packages/torch/nn/modules/transformer.py:382: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.self_attn.batch_first was not True(use batch_first for better inference performance)
+  warnings.warn(
+STRICT_LOAD_OK /home/yangsen/osx_ur/catkin_ws/src/osx_vla/externals/lap/artifacts/w3/canonical_acceptance_v1/deployment True
+HANDOFF_OK /home/yangsen/osx_ur/catkin_ws/src/osx_vla/externals/lap/artifacts/w3/canonical_acceptance_v1/deployment
+PACKAGE_IDENTITY_OK 4a9a697e565316236e6712adc17db1c0cd6d5b5c c6590fd9d3e13946210326ce2ccf0dc6ce72cad82705d0671f1f91775dd1df26
+SUMMARY {'execution_source_commit': '4a9a697e565316236e6712adc17db1c0cd6d5b5c', 'strict_load': True, 'handoff_deployment_root': '/home/yangsen/osx_ur/catkin_ws/src/osx_vla/externals/lap/artifacts/w3/canonical_acceptance_v1/deployment', 'acceptance_content_hash': 'c6590fd9d3e13946210326ce2ccf0dc6ce72cad82705d0671f1f91775dd1df26', 'preaccept_uninterrupted_versus_resumed': 'passed', 'ranks_restored': [0, 1]}
