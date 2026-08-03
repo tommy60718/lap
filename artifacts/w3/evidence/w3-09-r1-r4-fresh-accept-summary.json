@@ -1,0 +1,31 @@
+{
+  "schema": "osx_cover_w3_09_fresh_accept_summary_v1",
+  "repairs": ["W3-09-R1", "W3-09-R2", "W3-09-R3", "W3-09-R4"],
+  "preserved": ["W3-09-R5"],
+  "execution_source_commit": "5fcb1983f332ddc80977ca110781a81107970a0d",
+  "prior_reviewed_lap_head": "c8e63bdf02e6e58b546a543d2d6f35e4075f3d5f",
+  "outer_reopen_commit": "f01f5c22b34e0e1b3c5de878333ab006fcb4228c",
+  "host": "abacus",
+  "host_gpu_evidence": "A",
+  "wall_clock": {
+    "log_start": "2026-08-03T14:31:38+09:00",
+    "package_start": "2026-08-03T14:31:42+09:00",
+    "package_end": "2026-08-03T19:27:33+09:00",
+    "log_end": "2026-08-03T19:29:49+09:00",
+    "end_exit": 0
+  },
+  "preaccept": {
+    "uninterrupted_versus_resumed": "passed",
+    "next_batch_sample_ids_match": true,
+    "ranks_restored": [0, 1],
+    "exact_resume": "passed",
+    "two_rank_step": "passed"
+  },
+  "acceptance_content_hash": "7e387468f2f15a9b18179df509f2aa58115b5b688774ad828cdbd2e24b4fad8c",
+  "package_identity_content_hash": "efd6b572b0c9629ab7732fd2d2a2eec7190e99ffb4f5350aef781b1d5f7b30b9",
+  "training_best_pt_sha256": "f42947377ae2cb0c09eb9bc68abc6c63340882bdbb711118a57681316808e345",
+  "deployment_model_pt_sha256": "7dc74431ecc7369f2bae5a297a63c65ccac23b17f8da8598de12e3c8e5c0ca2c",
+  "w5_handoff_deployment_root": "/home/yangsen/osx_ur/catkin_ws/src/osx_vla/externals/lap/artifacts/w3/canonical_acceptance_v1/deployment",
+  "w3_to_w5_handoff_state": "BLOCKED",
+  "note": "Fresh full canonical accept at execution_source 5fcb198: valid both-rank sampler-continuation preaccept preceded the 50-epoch run; PACKAGE_IDENTITY sealed and independently revalidated after final publish; multi-GB .pt payloads remain on disk only."
+}
