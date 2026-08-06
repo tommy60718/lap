@@ -63,12 +63,12 @@ def _request(*, episode_id: str = "ep-acc", timestep: int = 0) -> dict[str, Any]
 
 class RecordingCandidateGenerator:
     def __init__(self, candidates: np.ndarray) -> None:
-        self._candidates = np.asarray(candidates, dtype=np.float64)
+        self.candidates = np.asarray(candidates, dtype=np.float64)
         self.calls: list[dict[str, Any]] = []
 
     def generate(self, **kwargs: Any) -> np.ndarray:
         self.calls.append({"candidate_count": kwargs["candidate_count"]})
-        return self._candidates[: kwargs["candidate_count"]].copy()
+        return self.candidates[: kwargs["candidate_count"]].copy()
 
 
 class RecordingHistoryManager:
@@ -177,12 +177,12 @@ def test_authority_context_candidate_matrix(
     if authority == "shadow":
         assert response["returned_candidate_index"] == 0
         assert response["hypothetical_selected_candidate_index"] == expected_selected
-        np.testing.assert_array_equal(actions, generator._candidates[0])
+        np.testing.assert_array_equal(actions, generator.candidates[0])
         np.testing.assert_array_equal(history.pending_row, history.last_histories[0, 6])
     else:
         assert response["returned_candidate_index"] == expected_selected
         assert response["hypothetical_selected_candidate_index"] is None
-        np.testing.assert_array_equal(actions, generator._candidates[expected_selected])
+        np.testing.assert_array_equal(actions, generator.candidates[expected_selected])
         np.testing.assert_array_equal(
             history.pending_row,
             history.last_histories[expected_selected, 6],
