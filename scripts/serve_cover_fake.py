@@ -10,8 +10,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import socket
-from typing import Any
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import tyro
@@ -24,7 +23,6 @@ from lap.verifiers.cover.action_adapter import NormalizationArtifact
 from lap.verifiers.cover.history import EpisodeHistoryManager
 from lap.verifiers.cover.scorer import FakeCoverScorer
 from lap.verifiers.cover.scorer import ScorerCompatibility
-
 
 Authority = Literal["disabled", "shadow", "active"]
 ExecutionContext = Literal["test", "robot"]

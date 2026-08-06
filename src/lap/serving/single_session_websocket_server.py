@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import http
 import logging
 import time
 import traceback
 from typing import Any
-from typing import Callable
 
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
