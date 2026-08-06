@@ -114,7 +114,7 @@ class NoiseMappedCandidateGenerator:
         noise_arr = np.asarray(noise, dtype=np.float64)
         if noise_arr.ndim == 2:
             noise_arr = noise_arr[None, ...]
-        indices = [int(round(float(sample.reshape(-1)[0]))) % len(self._catalog) for sample in noise_arr]
+        indices = [round(float(sample.reshape(-1)[0])) % len(self._catalog) for sample in noise_arr]
         return self._catalog[indices].copy()
 
 

@@ -196,9 +196,7 @@ def convert_absolute_targets_to_relative_rows(
         positions = np.broadcast_to(positions, (row_count, 3)).copy()
         rotation_vectors = np.broadcast_to(rotation_vectors, (row_count, 3)).copy()
     elif positions.shape != (row_count, 3) or rotation_vectors.shape != (row_count, 3):
-        raise ValueError(
-            "reference poses must be shape [3] for broadcast or [N, 3] matching absolute_targets"
-        )
+        raise ValueError("reference poses must be shape [3] for broadcast or [N, 3] matching absolute_targets")
     else:
         positions = np.asarray(positions, dtype=np.float64, order="C")
         rotation_vectors = np.asarray(rotation_vectors, dtype=np.float64, order="C")
