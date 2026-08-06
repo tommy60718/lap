@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from lap.policies.cover_policy_wrapper import CoverPolicyWrapper
 from lap.verifiers.cover.accepted_w3_scorer import load_accepted_w3_deployment_scorer
@@ -16,6 +16,7 @@ from lap.verifiers.pi05_horizon import Pi05Policy
 from lap.verifiers.pi05_horizon import load_pi05_horizon_generator
 
 W5_CANDIDATE_COUNT = 2
+ExecutionContext = Literal["test", "robot"]
 
 
 def load_w2_normalization_artifact(path: Path) -> tuple[NormalizationArtifact, str]:
@@ -33,8 +34,9 @@ def build_real_cover_shadow_policy(
     normalization: NormalizationArtifact,
     artifact_identity: str,
     w3_package_root: Path,
+    execution_context: ExecutionContext = "test",
 ) -> CoverPolicyWrapper:
-    """Compose offline test-context shadow authority through the accepted W4 wrapper."""
+    """Compose real-CoVer shadow authority through the accepted W4 wrapper."""
 
     scorer = load_accepted_w3_deployment_scorer(
         Path(w3_package_root),
@@ -46,7 +48,7 @@ def build_real_cover_shadow_policy(
     )
     return CoverPolicyWrapper(
         authority="shadow",
-        execution_context="test",
+        execution_context=execution_context,
         candidate_count=W5_CANDIDATE_COUNT,
         candidate_generator=candidate_generator,
         history_manager=history,
@@ -62,6 +64,7 @@ def build_real_cover_shadow_policy_from_packages(
     normalization_artifact_path: Path,
     pi05_policy: Pi05Policy | None = None,
     pi05_content_identity: str | None = None,
+    execution_context: ExecutionContext = "test",
 ) -> CoverPolicyWrapper:
     """Load packages (or inject a validated Pi0.5 policy) and build the shadow composition."""
 
@@ -81,6 +84,7 @@ def build_real_cover_shadow_policy_from_packages(
         normalization=normalization,
         artifact_identity=artifact_identity,
         w3_package_root=Path(w3_package_root),
+        execution_context=execution_context,
     )
 
 
